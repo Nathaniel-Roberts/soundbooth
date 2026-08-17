@@ -5,19 +5,27 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
 // DefaultDevice is the sentinel for the system default input device.
 const DefaultDevice = "System default"
 
+// Device is a capture device: Name matches sox -t coreaudio, AVIndex is
+// the avfoundation index ffmpeg wants (-1 = system default).
+type Device struct {
+	Name    string
+	AVIndex int
+}
+
 var avDeviceRe = regexp.MustCompile(`\[(\d+)\]\s+(.+)$`)
 
-// listInputDevices returns the coreaudio capture device names, using
-// ffmpeg's avfoundation listing (the names match what sox -t coreaudio
-// accepts). The system default is always first.
-func listInputDevices() []string {
-	devices := []string{DefaultDevice}
+// listInputDevices returns the capture devices from ffmpeg's avfoundation
+// listing (the names match what sox -t coreaudio accepts). The system
+// default is always first.
+func listInputDevices() []Device {
+	devices := []Device{{Name: DefaultDevice, AVIndex: -1}}
 	ffmpeg, err := findBin("ffmpeg")
 	if err != nil {
 		return devices
@@ -38,7 +46,8 @@ func listInputDevices() []string {
 			continue
 		}
 		if m := avDeviceRe.FindStringSubmatch(line); m != nil {
-			devices = append(devices, strings.TrimSpace(m[2]))
+			idx, _ := strconv.Atoi(m[1])
+			devices = append(devices, Device{Name: strings.TrimSpace(m[2]), AVIndex: idx})
 		}
 	}
 	return devices

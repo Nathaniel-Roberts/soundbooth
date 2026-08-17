@@ -11,6 +11,8 @@ type Config struct {
 	Device     string `json:"device"`
 	OutDir     string `json:"out_dir"`
 	Channels   int    `json:"channels"` // 1 = mono, 2 = stereo
+	Mode       string `json:"mode"`     // "record" or "armed"
+	BufferMin  int    `json:"buffer_min"`
 	Transcribe bool   `json:"transcribe"`
 	Model      string `json:"model"`
 	Speakers   int    `json:"speakers"` // 0 = auto
@@ -23,6 +25,8 @@ func defaultConfig() Config {
 		Device:     DefaultDevice,
 		OutDir:     filepath.Join(home, "Recordings"),
 		Channels:   1,
+		Mode:       "record",
+		BufferMin:  10,
 		Transcribe: true,
 		Model:      "large-v3-turbo",
 		Speakers:   0,
@@ -60,6 +64,12 @@ func loadConfig() Config {
 	}
 	if cfg.Channels != 1 && cfg.Channels != 2 {
 		cfg.Channels = 1
+	}
+	if cfg.Mode != "armed" {
+		cfg.Mode = "record"
+	}
+	if cfg.BufferMin < 1 || cfg.BufferMin > 60 {
+		cfg.BufferMin = 10
 	}
 	return cfg
 }

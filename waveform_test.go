@@ -32,6 +32,18 @@ func TestRenderWaveSilenceHairline(t *testing.T) {
 	}
 }
 
+func TestRenderWaveStereoLanes(t *testing.T) {
+	cols := make([]waveCol, 20)
+	for i := range cols {
+		cols[i] = waveCol{rms: 0.3, peak: 0.7, rmsR: 0.1, peakR: 0.2}
+	}
+	out := renderWaveStereo(cols, 10, 8)
+	lines := strings.Split(out, "\n")
+	if len(lines) != 8 {
+		t.Fatalf("expected 8 rows (two 4-row lanes), got %d", len(lines))
+	}
+}
+
 func TestLvlMapping(t *testing.T) {
 	if lvl(0) != 0 {
 		t.Errorf("lvl(0) = %v, want 0", lvl(0))

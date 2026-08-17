@@ -9,8 +9,25 @@ import (
 // waveCol is one rendered sub-column (one meter tick = one Braille dot
 // column, i.e. 50 ms per dot column, 100 ms per character cell).
 type waveCol struct {
-	rms, peak float64
-	clip      bool
+	rms, peak   float64 // left (or mono)
+	rmsR, peakR float64 // right
+	clip        bool
+	paused      bool
+}
+
+// renderWaveStereo draws two stacked lanes (L over R) within hCells rows.
+func renderWaveStereo(cols []waveCol, wCells, hCells int) string {
+	lane := hCells / 2
+	if lane < 3 {
+		return renderWave(cols, wCells, hCells)
+	}
+	right := make([]waveCol, len(cols))
+	for i, c := range cols {
+		right[i] = waveCol{rms: c.rmsR, peak: c.peakR, clip: c.clip, paused: c.paused}
+	}
+	top := renderWave(cols, wCells, lane)
+	bottom := renderWave(right, wCells, lane)
+	return top + "\n" + bottom
 }
 
 // brailleDot returns the bit for dot (x 0..1, y 0..3) inside a Braille cell.
@@ -42,6 +59,7 @@ func renderWave(cols []waveCol, wCells, hCells int) string {
 	env := make([]int, need)
 	core := make([]int, need)
 	clip := make([]bool, need)
+	paused := make([]bool, need)
 	for i, c := range cols {
 		e := int(c.peak*float64(half) + 0.5)
 		if e < 1 {
@@ -57,6 +75,7 @@ func renderWave(cols []waveCol, wCells, hCells int) string {
 		env[pad+i] = e
 		core[pad+i] = k
 		clip[pad+i] = c.clip
+		paused[pad+i] = c.paused
 	}
 	for i := 0; i < pad; i++ {
 		env[i] = 1
@@ -77,11 +96,15 @@ func renderWave(cols []waveCol, wCells, hCells int) string {
 			bits := 0
 			cellCore := true // whole cell inside the RMS core?
 			cellClip := false
+			cellPaused := false
 			cellMaxEnv := 0
 			for sub := 0; sub < 2; sub++ {
 				ci := cx*2 + sub
 				if clip[ci] {
 					cellClip = true
+				}
+				if paused[ci] {
+					cellPaused = true
 				}
 				if env[ci] > cellMaxEnv {
 					cellMaxEnv = env[ci]
@@ -114,7 +137,8 @@ func renderWave(cols []waveCol, wCells, hCells int) string {
 				style = &waveCoreStyle
 			}
 			// Silence renders as just the 1-dot-each-side hairline: dim it.
-			if !cellClip && cellMaxEnv <= 1 {
+			// Paused spans render grey too — visible but clearly inert.
+			if (!cellClip && cellMaxEnv <= 1) || cellPaused {
 				style = &waveMidStyle
 			}
 			if style != lastStyle {

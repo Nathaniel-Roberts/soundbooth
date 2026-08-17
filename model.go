@@ -19,6 +19,7 @@ type screen int
 
 const (
 	screenSetup screen = iota
+	screenArmed
 	screenRecording
 	screenTranscribing
 	screenDone
@@ -30,6 +31,8 @@ const (
 	fieldOutDir
 	fieldName
 	fieldChannels
+	fieldMode
+	fieldBuffer
 	fieldTranscribe
 	fieldModel
 	fieldSpeakers
@@ -40,6 +43,7 @@ const (
 
 var modelChoices = []string{"large-v3-turbo", "large-v3", "medium", "small", "base"}
 var languageChoices = []string{"en", "auto"}
+var bufferChoices = []int{5, 10, 15, 20, 30}
 
 type meterMsg MeterTick
 type meterClosedMsg struct{}
@@ -55,7 +59,7 @@ type model struct {
 	height int
 
 	// setup
-	devices   []string
+	devices   []Device
 	devIdx    int
 	cursor    int
 	editing   bool
@@ -63,20 +67,26 @@ type model struct {
 	nameInput textinput.Model
 	setupErr  string
 
-	// recording
-	rec       *Recorder
+	// live capture (either mode)
+	rec       *Recorder // record-now mode
+	spool     *Spooler  // armed mode
+	meter     *Meter    // armed mode's meter (record mode uses rec.Meter)
+	armStart  time.Time
+	mark      time.Time // armed: when the save was triggered
 	file      string
+	name      string
 	wave      []waveCol
 	rmaxdb    float64
 	clips     int
 	clipTicks int
 
 	// transcription
-	trans     *Transcriber
-	spin      spinner.Model
-	transLog  []string
-	transErr  error
-	didTrans  bool
+	trans    *Transcriber
+	spin     spinner.Model
+	transLog []string
+	transErr error
+	didTrans bool
+	preview  []string
 }
 
 func newModel() model {
@@ -85,7 +95,7 @@ func newModel() model {
 	devices := listInputDevices()
 	devIdx := 0
 	for i, d := range devices {
-		if d == cfg.Device {
+		if d.Name == cfg.Device {
 			devIdx = i
 		}
 	}
@@ -116,6 +126,16 @@ func newModel() model {
 }
 
 func (m model) Init() tea.Cmd { return nil }
+
+func (m *model) ticks() chan MeterTick {
+	if m.meter != nil {
+		return m.meter.Ticks
+	}
+	if m.rec != nil && m.rec.Meter != nil {
+		return m.rec.Meter.Ticks
+	}
+	return nil
+}
 
 func waitMeter(ch chan MeterTick) tea.Cmd {
 	return func() tea.Msg {
@@ -153,14 +173,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.KeyMsg:
 		if msg.String() == "ctrl+c" {
-			if m.rec != nil {
-				m.rec.Stop()
-			}
+			m.teardown()
 			return m, tea.Quit
 		}
 		switch m.scr {
 		case screenSetup:
 			return m.updateSetupKeys(msg)
+		case screenArmed:
+			return m.updateArmedKeys(msg)
 		case screenRecording:
 			return m.updateRecordingKeys(msg)
 		case screenDone:
@@ -169,11 +189,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case meterMsg:
-		if m.scr != screenRecording {
+		if m.scr != screenRecording && m.scr != screenArmed {
 			return m, nil
 		}
 		t := MeterTick(msg)
-		m.wave = append(m.wave, waveCol{rms: t.RMS, peak: t.Peak, clip: t.Clip})
+		col := waveCol{rms: t.RMS, peak: t.Peak, rmsR: t.RMSR, peakR: t.PeakR, clip: t.Clip}
+		if m.rec != nil && m.rec.Paused() {
+			col.paused = true
+			col.clip = false
+		}
+		m.wave = append(m.wave, col)
 		if len(m.wave) > 2048 {
 			m.wave = m.wave[len(m.wave)-1024:]
 		}
@@ -181,20 +206,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if t.DB > m.rmaxdb {
 			m.rmaxdb = t.DB
 		}
-		if t.Clip {
+		if col.clip {
 			m.clips++
 			m.clipTicks = 40
 		} else if m.clipTicks > 0 {
 			m.clipTicks--
 		}
-		return m, waitMeter(m.rec.Ticks)
+		return m, waitMeter(m.ticks())
 
 	case meterClosedMsg:
 		return m, nil
 
 	case recErrMsg:
-		if m.scr == screenRecording && msg.err != nil {
-			m.rec.Stop()
+		if (m.scr == screenRecording || m.scr == screenArmed) && msg.err != nil {
+			m.teardown()
 			m.setupErr = msg.err.Error()
 			m.scr = screenSetup
 		}
@@ -213,6 +238,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case transDoneMsg:
 		m.transErr = msg.err
 		m.didTrans = msg.err == nil
+		if m.didTrans {
+			m.preview = transcriptPreview(m.trans.OutDir, m.file, 6)
+		}
 		m.scr = screenDone
 		return m, nil
 
@@ -229,6 +257,23 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.updateEditing(msg)
 	}
 	return m, nil
+}
+
+// teardown stops every live process. Recordings in flight are finalised;
+// an untriggered armed buffer is discarded (that is its contract).
+func (m *model) teardown() {
+	if m.rec != nil {
+		_ = m.rec.Stop()
+	}
+	if m.spool != nil {
+		m.spool.Stop()
+		m.spool.Cleanup()
+		m.spool = nil
+	}
+	if m.meter != nil {
+		m.meter.Stop()
+		m.meter = nil
+	}
 }
 
 // --- setup ---
@@ -265,7 +310,7 @@ func (m model) updateSetupKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case fieldTranscribe:
 			m.cfg.Transcribe = !m.cfg.Transcribe
 		case fieldStart:
-			return m.startRecording()
+			return m.start()
 		default:
 			m.adjustField(1)
 		}
@@ -283,6 +328,20 @@ func (m *model) adjustField(dir int) {
 		} else {
 			m.cfg.Channels = 1
 		}
+	case fieldMode:
+		if m.cfg.Mode == "record" {
+			m.cfg.Mode = "armed"
+		} else {
+			m.cfg.Mode = "record"
+		}
+	case fieldBuffer:
+		i := 0
+		for j, b := range bufferChoices {
+			if b == m.cfg.BufferMin {
+				i = j
+			}
+		}
+		m.cfg.BufferMin = bufferChoices[(i+dir+len(bufferChoices))%len(bufferChoices)]
 	case fieldTranscribe:
 		m.cfg.Transcribe = !m.cfg.Transcribe
 	case fieldModel:
@@ -330,13 +389,13 @@ func (m model) updateEditing(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
-func (m model) startRecording() (tea.Model, tea.Cmd) {
+func (m model) start() (tea.Model, tea.Cmd) {
 	m.setupErr = ""
-	m.cfg.Device = m.devices[m.devIdx]
+	m.cfg.Device = m.devices[m.devIdx].Name
 	m.cfg.OutDir = expandHome(strings.TrimSpace(m.outInput.Value()))
-	name := strings.TrimSpace(m.nameInput.Value())
-	if name == "" {
-		name = "recording"
+	m.name = strings.TrimSpace(m.nameInput.Value())
+	if m.name == "" {
+		m.name = "recording"
 	}
 	if err := os.MkdirAll(m.cfg.OutDir, 0o755); err != nil {
 		m.setupErr = err.Error()
@@ -344,8 +403,20 @@ func (m model) startRecording() (tea.Model, tea.Cmd) {
 	}
 	_ = m.cfg.save()
 
+	m.wave = nil
+	m.rmaxdb = -99
+	m.clips = 0
+	m.clipTicks = 0
+
+	if m.cfg.Mode == "armed" {
+		return m.startArmed()
+	}
+	return m.startRecording()
+}
+
+func (m model) startRecording() (tea.Model, tea.Cmd) {
 	m.file = filepath.Join(m.cfg.OutDir,
-		fmt.Sprintf("%s-%s.flac", name, time.Now().Format("20060102-150405")))
+		fmt.Sprintf("%s-%s.flac", m.name, time.Now().Format("20060102-150405")))
 	rec, err := NewRecorder(m.cfg.Device, m.file, m.cfg.Channels)
 	if err != nil {
 		m.setupErr = err.Error()
@@ -356,41 +427,132 @@ func (m model) startRecording() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	m.rec = rec
-	m.wave = nil
-	m.rmaxdb = -99
-	m.clips = 0
-	m.clipTicks = 0
 	m.scr = screenRecording
-	return m, tea.Batch(waitMeter(rec.Ticks), waitRecErr(rec.Err))
+	return m, tea.Batch(waitMeter(rec.Meter.Ticks), waitRecErr(rec.Err))
+}
+
+func (m model) startArmed() (tea.Model, tea.Cmd) {
+	window := time.Duration(m.cfg.BufferMin) * time.Minute
+	spool, err := startSpooler(m.devices[m.devIdx].AVIndex, m.cfg.Channels, window)
+	if err != nil {
+		m.setupErr = err.Error()
+		return m, nil
+	}
+	soxPath, err := findBin("sox")
+	if err != nil {
+		spool.Stop()
+		spool.Cleanup()
+		m.setupErr = err.Error()
+		return m, nil
+	}
+	meter, err := startMeter(soxPath, m.cfg.Device, m.cfg.Channels)
+	if err != nil {
+		spool.Stop()
+		spool.Cleanup()
+		m.setupErr = err.Error()
+		return m, nil
+	}
+	m.spool = spool
+	m.meter = meter
+	m.armStart = time.Now()
+	m.mark = time.Time{}
+	m.scr = screenArmed
+	return m, waitMeter(meter.Ticks)
+}
+
+// --- armed ---
+
+func (m model) updateArmedKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "enter", "s":
+		// Save trigger: keep the buffered window, keep capturing forward.
+		m.mark = time.Now()
+		m.spool.Trigger()
+		m.file = filepath.Join(m.cfg.OutDir,
+			fmt.Sprintf("%s-%s.flac", m.name, m.mark.Format("20060102-150405")))
+		m.scr = screenRecording
+		return m, nil
+	case "x", "esc":
+		// Disarm: the whole point is nothing survives unless triggered.
+		m.teardown()
+		m.scr = screenSetup
+		return m, nil
+	}
+	return m, nil
 }
 
 // --- recording ---
 
 func (m model) updateRecordingKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	armed := m.spool != nil
 	switch msg.String() {
 	case "enter", "s":
-		m.rec.Stop()
+		if err := m.finishCapture(); err != nil {
+			m.transErr = err
+			m.scr = screenDone
+			return m, nil
+		}
 		if m.cfg.Transcribe {
-			trans, err := startTranscribe(m.file, m.cfg.Model, m.cfg.Language, m.cfg.Speakers)
-			if err != nil {
-				m.transErr = err
-				m.scr = screenDone
-				return m, nil
-			}
-			m.trans = trans
-			m.transLog = nil
-			m.scr = screenTranscribing
-			return m, tea.Batch(m.spin.Tick, waitTransLine(trans.Lines), waitTransDone(trans.Done))
+			return m.beginTranscribe()
 		}
 		m.scr = screenDone
 		return m, nil
+	case "p", " ":
+		if !armed && m.rec != nil {
+			if m.rec.Paused() {
+				if err := m.rec.Resume(); err != nil {
+					m.setupErr = err.Error()
+				}
+			} else {
+				m.rec.Pause()
+			}
+		}
+		return m, nil
 	case "x", "esc":
 		// keep the file, skip transcription
-		m.rec.Stop()
+		if err := m.finishCapture(); err != nil {
+			m.transErr = err
+		}
 		m.scr = screenDone
 		return m, nil
 	}
 	return m, nil
+}
+
+// finishCapture stops whichever capture path is live and assembles m.file.
+func (m *model) finishCapture() error {
+	if m.spool != nil {
+		segs := m.spool.Stop()
+		if m.meter != nil {
+			m.meter.Stop()
+			m.meter = nil
+		}
+		soxPath, err := findBin("sox")
+		if err != nil {
+			return err
+		}
+		err = concatFlac(soxPath, segs, m.file)
+		m.spool.Cleanup()
+		m.spool = nil
+		return err
+	}
+	if m.rec != nil {
+		return m.rec.Stop()
+	}
+	return fmt.Errorf("nothing was recording")
+}
+
+func (m model) beginTranscribe() (tea.Model, tea.Cmd) {
+	trans, err := startTranscribe(m.file, m.cfg.Model, m.cfg.Language, m.cfg.Speakers)
+	if err != nil {
+		m.transErr = err
+		m.scr = screenDone
+		return m, nil
+	}
+	m.trans = trans
+	m.transLog = nil
+	m.scr = screenTranscribing
+	return m, tea.Batch(m.spin.Tick, waitTransLine(trans.Lines), waitTransDone(trans.Done))
 }
 
 // --- done ---
@@ -400,14 +562,41 @@ func (m model) updateDoneKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "q", "esc":
 		return m, tea.Quit
 	case "o":
-		dir := filepath.Dir(m.file)
-		_ = exec.Command("open", dir).Start()
+		_ = exec.Command("open", filepath.Dir(m.file)).Start()
+	case "t":
+		if !m.didTrans && m.file != "" {
+			if _, err := os.Stat(m.file); err == nil {
+				m.transErr = nil
+				return m.beginTranscribe()
+			}
+		}
 	case "n":
 		fresh := newModel()
 		fresh.width, fresh.height = m.width, m.height
 		return fresh, nil
 	}
 	return m, nil
+}
+
+func transcriptPreview(outDir, audioFile string, lines int) []string {
+	base := filepath.Base(audioFile)
+	stem := strings.TrimSuffix(base, filepath.Ext(base))
+	data, err := os.ReadFile(filepath.Join(outDir, stem+".txt"))
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, l := range strings.Split(string(data), "\n") {
+		l = strings.TrimSpace(l)
+		if l == "" {
+			continue
+		}
+		out = append(out, l)
+		if len(out) >= lines {
+			break
+		}
+	}
+	return out
 }
 
 func expandHome(p string) string {
@@ -425,8 +614,10 @@ func (m model) View() string {
 	switch m.scr {
 	case screenSetup:
 		body = m.viewSetup()
+	case screenArmed:
+		body = m.viewLive()
 	case screenRecording:
-		body = m.viewRecording()
+		body = m.viewLive()
 	case screenTranscribing:
 		body = m.viewTranscribing()
 	case screenDone:
@@ -441,26 +632,32 @@ func (m model) viewSetup() string {
 	if m.cfg.Speakers > 0 {
 		speakers = strconv.Itoa(m.cfg.Speakers)
 	}
-	transcribe := "off"
-	if m.cfg.Transcribe {
-		transcribe = "on"
+	onOff := func(b bool, on, off string) string {
+		if b {
+			return on
+		}
+		return off
 	}
-	channels := "mono"
-	if m.cfg.Channels == 2 {
-		channels = "stereo"
+	mode := "record now"
+	startLabel := "[ Start recording ]"
+	if m.cfg.Mode == "armed" {
+		mode = "armed (replay buffer)"
+		startLabel = "[ Arm replay buffer ]"
 	}
 	rows := []struct {
 		label, value string
 	}{
-		{"Microphone", m.devices[m.devIdx]},
+		{"Microphone", m.devices[m.devIdx].Name},
 		{"Save to", m.outInput.View()},
 		{"Name", m.nameInput.View()},
-		{"Channels", channels},
-		{"Transcribe", transcribe},
+		{"Channels", onOff(m.cfg.Channels == 2, "stereo", "mono")},
+		{"Mode", mode},
+		{"Buffer", fmt.Sprintf("last %d min (armed mode)", m.cfg.BufferMin)},
+		{"Transcribe", onOff(m.cfg.Transcribe, "on", "off")},
 		{"Whisper model", m.cfg.Model},
 		{"Speakers", speakers},
 		{"Language", m.cfg.Language},
-		{"", "[ Start recording ]"},
+		{"", startLabel},
 	}
 	var b strings.Builder
 	for i, r := range rows {
@@ -469,6 +666,9 @@ func (m model) viewSetup() string {
 		if i == m.cursor {
 			cursor = focusStyle.Render("> ")
 			style = focusStyle
+		}
+		if i == fieldBuffer && m.cfg.Mode != "armed" && i != m.cursor {
+			style = dimStyle
 		}
 		if r.label == "" {
 			b.WriteString(fmt.Sprintf("%s%s\n", cursor, style.Render(r.value)))
@@ -491,23 +691,24 @@ func (m model) viewSetup() string {
 	return lipgloss.JoinVertical(lipgloss.Left, parts...)
 }
 
-func (m model) viewRecording() string {
+func (m model) viewLive() string {
 	wCells := m.width - 6
 	if wCells < 20 {
 		wCells = 60
 	}
-	hCells := (m.height - 10)
-	if hCells > 12 {
-		hCells = 12
+	hCells := m.height - 10
+	if hCells > 14 {
+		hCells = 14
 	}
 	if hCells < 5 {
 		hCells = 5
 	}
-	wave := renderWave(m.wave, wCells, hCells)
-
-	elapsed := m.rec.Elapsed().Round(time.Second)
-	mins := int(elapsed.Minutes())
-	secs := int(elapsed.Seconds()) % 60
+	var wave string
+	if m.cfg.Channels == 2 {
+		wave = renderWaveStereo(m.wave, wCells, hCells)
+	} else {
+		wave = renderWave(m.wave, wCells, hCells)
+	}
 
 	var levelStyle lipgloss.Style
 	var advice string
@@ -521,14 +722,44 @@ func (m model) viewRecording() string {
 	default:
 		levelStyle, advice = okStyle, "level OK"
 	}
-	status := fmt.Sprintf("%s  %s  %s",
-		dimStyle.Render(fmt.Sprintf("%02d:%02d", mins, secs)),
-		levelStyle.Render(fmt.Sprintf("peak %d dB  %s", int(m.rmaxdb), advice)),
-		dimStyle.Render(fmt.Sprintf("%s  %s", filepath.Base(m.file), humanSize(m.rec.FileSize()))),
-	)
-	hints := keyHint("enter", "stop"+transcribeSuffix(m.cfg.Transcribe), "x", "stop, skip transcribe", "ctrl+c", "abort")
-	return lipgloss.JoinVertical(lipgloss.Left,
-		panelStyle.Render(wave), status, "", hints)
+	level := levelStyle.Render(fmt.Sprintf("peak %d dB  %s", int(m.rmaxdb), advice))
+
+	var badge, detail, hints string
+	switch {
+	case m.scr == screenArmed:
+		buffered := time.Since(m.armStart)
+		window := time.Duration(m.cfg.BufferMin) * time.Minute
+		if buffered > window {
+			buffered = window
+		}
+		badge = warnStyle.Render("● ARMED")
+		detail = dimStyle.Render(fmt.Sprintf("buffered %s of last %d min — nothing kept unless you save",
+			fmtDur(buffered), m.cfg.BufferMin))
+		hints = keyHint("enter", fmt.Sprintf("save last %d min + keep recording", m.cfg.BufferMin), "x", "disarm (discard)", "ctrl+c", "quit")
+	case m.spool != nil:
+		badge = errStyle.Render("● REC")
+		detail = dimStyle.Render(fmt.Sprintf("%s + the %d min before the trigger  ·  %s",
+			fmtDur(time.Since(m.mark)), m.cfg.BufferMin, filepath.Base(m.file)))
+		hints = keyHint("enter", "stop"+transcribeSuffix(m.cfg.Transcribe), "x", "stop, skip transcribe", "ctrl+c", "abort")
+	case m.rec != nil && m.rec.Paused():
+		badge = warnStyle.Render("● PAUSED")
+		detail = dimStyle.Render(fmt.Sprintf("%s recorded  ·  %s  %s",
+			fmtDur(m.rec.Elapsed()), filepath.Base(m.file), humanSize(m.rec.FileSize())))
+		hints = keyHint("p", "resume", "enter", "stop"+transcribeSuffix(m.cfg.Transcribe), "x", "stop, skip transcribe")
+	default:
+		badge = errStyle.Render("● REC")
+		detail = dimStyle.Render(fmt.Sprintf("%s  ·  %s  %s",
+			fmtDur(m.rec.Elapsed()), filepath.Base(m.file), humanSize(m.rec.FileSize())))
+		hints = keyHint("p", "pause", "enter", "stop"+transcribeSuffix(m.cfg.Transcribe), "x", "stop, skip transcribe")
+	}
+
+	status := badge + "  " + level + "  " + detail
+	return lipgloss.JoinVertical(lipgloss.Left, panelStyle.Render(wave), status, "", hints)
+}
+
+func fmtDur(d time.Duration) string {
+	d = d.Round(time.Second)
+	return fmt.Sprintf("%02d:%02d", int(d.Minutes()), int(d.Seconds())%60)
 }
 
 func transcribeSuffix(on bool) string {
@@ -559,12 +790,24 @@ func (m model) viewDone() string {
 	switch {
 	case m.didTrans && m.trans != nil:
 		lines = append(lines, okStyle.Render("transcript in    ")+valueStyle.Render(m.trans.OutDir))
-		lines = append(lines, dimStyle.Render("(json with speaker labels, plus srt, vtt, txt)"))
+		if len(m.preview) > 0 {
+			lines = append(lines, "")
+			for _, p := range m.preview {
+				if len(p) > 100 {
+					p = p[:100] + "…"
+				}
+				lines = append(lines, dimStyle.Render("  "+p))
+			}
+		}
 	case m.transErr != nil:
 		lines = append(lines, errStyle.Render("transcription failed: "+m.transErr.Error()))
-		lines = append(lines, dimStyle.Render("the recording is safe — rerun with: transcribe "+m.file))
+		lines = append(lines, dimStyle.Render("the recording is safe — press t to retry"))
 	}
-	hints := keyHint("n", "new recording", "o", "open folder", "q", "quit")
+	hintPairs := []string{"n", "new recording", "o", "open folder", "q", "quit"}
+	if !m.didTrans {
+		hintPairs = append([]string{"t", "transcribe"}, hintPairs...)
+	}
+	hints := keyHint(hintPairs...)
 	return lipgloss.JoinVertical(lipgloss.Left,
 		panelStyle.Render(strings.Join(lines, "\n")), "", hints)
 }
