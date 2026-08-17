@@ -54,7 +54,7 @@ var retentionChoices = []int{0, 7, 30, 90, 180}
 var modelChoices = []string{"large-v3-turbo", "large-v3", "medium", "small", "base"}
 var languageChoices = []string{"en", "auto"}
 var bufferChoices = []int{0, 5, 10, 15, 20, 30} // 0 = no buffer, record from trigger
-var zoomLevels = []int{1, 2, 5}                 // meter ticks per Braille sub-column
+var zoomLevels = []int{1, 2, 4, 10} // meter ticks per Braille sub-column
 
 // frameMsg is the live view's fixed 50 ms frame clock. Audio ticks are
 // pulled from the meter channels on each frame rather than pushed as
@@ -140,6 +140,13 @@ type model struct {
 	diskFree  int64
 	diskTick  int
 	frameGen  int // invalidates stale frame clocks
+
+	// perf overlay (toggled with f on the live screens)
+	showPerf   bool
+	perfLast   time.Time
+	perfAvgMs  float64
+	perfMaxMs  float64
+	perfTicks  float64
 
 	// transcription
 	trans      *Transcriber
@@ -238,6 +245,7 @@ func newModel() model {
 		searchInput: search,
 		spin:        sp,
 		rmaxdb:    -99,
+		zoomIdx:   1, // 100 ms cells; zoom 0 is the 50 ms close-up
 		orphans:   findOrphans(),
 		setupNote: setupNote,
 	}
@@ -256,7 +264,7 @@ func (m *model) ticks() chan MeterTick {
 }
 
 func frameTick(gen int) tea.Cmd {
-	return tea.Tick(50*time.Millisecond, func(time.Time) tea.Msg { return frameMsg{gen: gen} })
+	return tea.Tick(time.Second/tickHz, func(time.Time) tea.Msg { return frameMsg{gen: gen} })
 }
 
 func waitRecErr(ch chan error) tea.Cmd {
@@ -433,6 +441,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.gen != m.frameGen || (m.scr != screenRecording && m.scr != screenArmed) {
 			return m, nil // stale clock, or we left the live screens
 		}
+		now := time.Now()
+		if !m.perfLast.IsZero() {
+			iv := float64(now.Sub(m.perfLast).Microseconds()) / 1000
+			m.perfAvgMs += (iv - m.perfAvgMs) * 0.05
+			m.perfMaxMs *= 0.98
+			if iv > m.perfMaxMs {
+				m.perfMaxMs = iv
+			}
+		}
+		m.perfLast = now
+		pulled := 0
 		// pull the latest system-audio level first so mic columns built
 		// this frame carry it
 		if m.sysCap != nil {
@@ -460,6 +479,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					break drain
 				}
 				m.applyTick(t)
+				pulled++
 			default:
 				break drain
 			}
@@ -467,6 +487,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if closed {
 			m.reviveMeters()
 		}
+		m.perfTicks += (float64(pulled) - m.perfTicks) * 0.05
 		return m, frameTick(m.frameGen)
 
 	case recErrMsg:
@@ -610,10 +631,10 @@ func (m *model) applyTick(t MeterTick) {
 		col.clip = false
 	}
 	m.wave = append(m.wave, col)
-	if len(m.wave) > 8192 {
-		m.wave = m.wave[len(m.wave)-4096:]
+	if len(m.wave) > 16384 {
+		m.wave = m.wave[len(m.wave)-8192:]
 	}
-	m.rmaxdb -= 0.5 // decays 10 dB/s at 20 ticks/s
+	m.rmaxdb -= 10.0 / tickHz // decays 10 dB/s
 	if t.DB > m.rmaxdb {
 		m.rmaxdb = t.DB
 	}
@@ -624,15 +645,15 @@ func (m *model) applyTick(t MeterTick) {
 	if target > m.vuLevel {
 		m.vuLevel = target
 	} else {
-		m.vuLevel *= 0.82
+		m.vuLevel *= 0.905 // ~same release curve as the old 20 Hz 0.82
 	}
 	if col.clip {
 		m.clips++
-		m.clipTicks = 40
+		m.clipTicks = 2 * tickHz
 	} else if m.clipTicks > 0 {
 		m.clipTicks--
 	}
-	if m.diskTick++; m.diskTick >= 100 { // every ~5 s
+	if m.diskTick++; m.diskTick >= 5*tickHz { // every ~5 s
 		m.diskTick = 0
 		m.diskFree = freeBytes(m.cfg.OutDir)
 	}
@@ -1014,6 +1035,9 @@ func (m model) startArmed() (tea.Model, tea.Cmd) {
 
 func (m model) updateArmedKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
+	case "f":
+		m.showPerf = !m.showPerf
+		return m, nil
 	case "enter", "s":
 		if m.spool == nil {
 			// No buffer: standby only — recording starts right now.
@@ -1069,6 +1093,9 @@ func (m model) updateRecordingKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.zoomIdx < len(zoomLevels)-1 {
 			m.zoomIdx++
 		}
+		return m, nil
+	case "f":
+		m.showPerf = !m.showPerf
 		return m, nil
 	case "p", " ":
 		if m.sysCap != nil {

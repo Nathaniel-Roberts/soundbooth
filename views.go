@@ -4,12 +4,43 @@ import (
 	"fmt"
 	"math"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/charmbracelet/lipgloss"
 )
+
+var buildRevCache string
+
+// buildRev is the short git revision baked in by `go build` (module VCS
+// stamping), with + marking a dirty tree. Shown in the header so it is
+// always obvious which build is running.
+func buildRev() string {
+	if buildRevCache != "" {
+		return buildRevCache
+	}
+	buildRevCache = "dev"
+	if info, ok := debug.ReadBuildInfo(); ok {
+		rev, dirty := "", false
+		for _, s := range info.Settings {
+			switch s.Key {
+			case "vcs.revision":
+				rev = s.Value
+			case "vcs.modified":
+				dirty = s.Value == "true"
+			}
+		}
+		if len(rev) >= 7 {
+			buildRevCache = rev[:7]
+			if dirty {
+				buildRevCache += "+"
+			}
+		}
+	}
+	return buildRevCache
+}
 
 func (m model) View() string {
 	var body string
@@ -27,7 +58,7 @@ func (m model) View() string {
 	case screenDone:
 		body = m.viewDone()
 	}
-	header := titleStyle.Render("soundbooth") + dimStyle.Render("  record · meter · transcribe")
+	header := titleStyle.Render("soundbooth") + dimStyle.Render("  record · meter · transcribe  ·  "+buildRev())
 	return lipgloss.JoinVertical(lipgloss.Left, header, "", body)
 }
 
@@ -167,7 +198,12 @@ func themePreview(width int) string {
 
 // --- live (armed + recording) ---
 
+// lastViewNs is the previous live-frame build time, shown in the perf
+// overlay (single render goroutine; plain var is fine).
+var lastViewNs int64
+
 func (m model) viewLive() string {
+	viewStart := time.Now()
 	wCells := m.width - 6
 	if wCells < 20 {
 		wCells = 60
@@ -184,7 +220,7 @@ func (m model) viewLive() string {
 	}
 
 	z := zoomLevels[m.zoomIdx]
-	cellMs := z * 100
+	cellMs := z * 2000 / tickHz // 2 sub-columns per cell
 	cols := downsample(m.wave, z)
 
 	var markerCells []int
@@ -322,8 +358,20 @@ func (m model) viewLive() string {
 	if m.notice != "" {
 		parts = append(parts, warnStyle.Render(m.notice))
 	}
+	if m.showPerf {
+		fps := 0.0
+		if m.perfAvgMs > 0 {
+			fps = 1000 / m.perfAvgMs
+		}
+		parts = append(parts, dimStyle.Render(fmt.Sprintf(
+			"perf: %.1f fps · frame avg %.1f ms · max %.0f ms · ticks/frame %.2f · view %.2f ms · %s",
+			fps, m.perfAvgMs, m.perfMaxMs, m.perfTicks,
+			float64(lastViewNs)/1e6, buildRev())))
+	}
 	parts = append(parts, "", hints)
-	return lipgloss.JoinVertical(lipgloss.Left, parts...)
+	out := lipgloss.JoinVertical(lipgloss.Left, parts...)
+	lastViewNs = time.Since(viewStart).Nanoseconds()
+	return out
 }
 
 // wrapText word-wraps s to width columns.

@@ -141,7 +141,7 @@ func startSysCapture(file string) (*SysCapture, error) {
 			_ = enc.Wait()
 			close(s.Ticks)
 		}()
-		const framesPerTick = recSampleRate / 20 // 50 ms
+		const framesPerTick = recSampleRate / tickHz
 		buf := make([]byte, 32768)
 		var carry []byte
 		var sum2, peak float64

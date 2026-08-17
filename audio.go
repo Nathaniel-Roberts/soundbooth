@@ -28,7 +28,8 @@ type MeterTick struct {
 
 const (
 	meterRate     = 4000 // Hz for the metering stream
-	meterChunk    = 200  // samples per tick -> 50 ms
+	tickHz        = 40   // meter ticks per second (25 ms per Braille sub-column)
+	meterChunk    = meterRate / tickHz
 	dbFloor       = -50.0
 	clipThreshold = 0.999
 	recSampleRate = 48000
