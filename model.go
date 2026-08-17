@@ -56,10 +56,11 @@ var languageChoices = []string{"en", "auto"}
 var bufferChoices = []int{0, 5, 10, 15, 20, 30} // 0 = no buffer, record from trigger
 var zoomLevels = []int{1, 2, 5}                 // meter ticks per Braille sub-column
 
-type meterMsg MeterTick
-type meterClosedMsg struct{}
-type sysTickMsg MeterTick
-type sysTicksClosedMsg struct{}
+// frameMsg is the live view's fixed 50 ms frame clock. Audio ticks are
+// pulled from the meter channels on each frame rather than pushed as
+// messages: sox delivers ticks in bursts (pipe buffering), and painting
+// on arrival made the waveform crawl and lurch instead of scroll.
+type frameMsg struct{ gen int }
 type sysReadyMsg struct{ err error }
 type captionMsg string
 type captionsClosedMsg struct{}
@@ -138,6 +139,7 @@ type model struct {
 	notice    string
 	diskFree  int64
 	diskTick  int
+	frameGen  int // invalidates stale frame clocks
 
 	// transcription
 	trans      *Transcriber
@@ -253,17 +255,8 @@ func (m *model) ticks() chan MeterTick {
 	return nil
 }
 
-func waitMeter(ch chan MeterTick) tea.Cmd {
-	if ch == nil {
-		return nil
-	}
-	return func() tea.Msg {
-		t, ok := <-ch
-		if !ok {
-			return meterClosedMsg{}
-		}
-		return meterMsg(t)
-	}
+func frameTick(gen int) tea.Cmd {
+	return tea.Tick(50*time.Millisecond, func(time.Time) tea.Msg { return frameMsg{gen: gen} })
 }
 
 func waitRecErr(ch chan error) tea.Cmd {
@@ -272,16 +265,6 @@ func waitRecErr(ch chan error) tea.Cmd {
 
 func waitSysReady(s *SysCapture) tea.Cmd {
 	return func() tea.Msg { return sysReadyMsg{s.WaitReady(6 * time.Second)} }
-}
-
-func waitSysTick(ch chan MeterTick) tea.Cmd {
-	return func() tea.Msg {
-		t, ok := <-ch
-		if !ok {
-			return sysTicksClosedMsg{}
-		}
-		return sysTickMsg(t)
-	}
 }
 
 func waitCaption(ch chan string) tea.Cmd {
@@ -433,29 +416,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
-	case sysTickMsg:
-		m.sysLevel = MeterTick(msg)
-		if m.sysCap != nil {
-			ch := m.sysCap.Ticks
-		drainSys:
-			for i := 0; i < 60; i++ {
-				select {
-				case t, ok := <-ch:
-					if !ok {
-						break drainSys
-					}
-					m.sysLevel = t
-				default:
-					break drainSys
-				}
-			}
-			return m, waitSysTick(ch)
-		}
-		return m, nil
-
-	case sysTicksClosedMsg:
-		return m, nil
-
 	case captionMsg:
 		m.captions = append(m.captions, string(msg))
 		if len(m.captions) > 6 {
@@ -469,20 +429,34 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case captionsClosedMsg:
 		return m, nil
 
-	case meterMsg:
-		if m.scr != screenRecording && m.scr != screenArmed {
-			return m, nil
+	case frameMsg:
+		if msg.gen != m.frameGen || (m.scr != screenRecording && m.scr != screenArmed) {
+			return m, nil // stale clock, or we left the live screens
 		}
-		m.applyTick(MeterTick(msg))
-		// Drain any backlog in one update: if a frame ran slow (GPU busy
-		// with captions/transcription), queued ticks otherwise arrive one
-		// repaint each and the waveform lags and lurches behind live.
+		// pull the latest system-audio level first so mic columns built
+		// this frame carry it
+		if m.sysCap != nil {
+		drainSys:
+			for i := 0; i < 80; i++ {
+				select {
+				case t, ok := <-m.sysCap.Ticks:
+					if !ok {
+						break drainSys
+					}
+					m.sysLevel = t
+				default:
+					break drainSys
+				}
+			}
+		}
 		ch := m.ticks()
+		closed := false
 	drain:
-		for i := 0; i < 60; i++ {
+		for i := 0; i < 80; i++ {
 			select {
 			case t, ok := <-ch:
 				if !ok {
+					closed = true
 					break drain
 				}
 				m.applyTick(t)
@@ -490,25 +464,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				break drain
 			}
 		}
-		return m, waitMeter(ch)
-
-	case meterClosedMsg:
-		// The metering stream died (device change?). Try to revive it so
-		// the display keeps moving; capture recovery is recErrMsg's job.
-		if m.scr == screenRecording || m.scr == screenArmed {
-			if m.meter != nil {
-				if soxPath, err := findBin("sox"); err == nil {
-					if nm, err := startMeter(soxPath, m.cfg.Device, m.cfg.Channels); err == nil {
-						m.meter = nm
-						return m, waitMeter(nm.Ticks)
-					}
-				}
-			} else if m.rec != nil {
-				m.rec.reviveMeter()
-				return m, waitMeter(m.ticks())
-			}
+		if closed {
+			m.reviveMeters()
 		}
-		return m, nil
+		return m, frameTick(m.frameGen)
 
 	case recErrMsg:
 		if m.scr != screenRecording || msg.err == nil || m.rec == nil {
@@ -518,7 +477,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if err == nil {
 			m.notice = "input device hiccup — capture continued on " + dev
 			m.markers = append(m.markers, m.liveElapsed())
-			return m, tea.Batch(waitRecErr(m.rec.Err), waitMeter(m.ticks()))
+			return m, waitRecErr(m.rec.Err)
 		}
 		// Cannot continue: salvage what we have.
 		_ = m.rec.Stop()
@@ -676,6 +635,22 @@ func (m *model) applyTick(t MeterTick) {
 	if m.diskTick++; m.diskTick >= 100 { // every ~5 s
 		m.diskTick = 0
 		m.diskFree = freeBytes(m.cfg.OutDir)
+	}
+}
+
+// reviveMeters restarts a dead metering stream so the display keeps
+// moving (device change); capture recovery is recErrMsg's job.
+func (m *model) reviveMeters() {
+	if m.meter != nil {
+		if soxPath, err := findBin("sox"); err == nil {
+			if nm, err := startMeter(soxPath, m.cfg.Device, m.cfg.Channels); err == nil {
+				m.meter = nm
+			}
+		}
+		return
+	}
+	if m.rec != nil {
+		m.rec.reviveMeter()
 	}
 }
 
@@ -975,7 +950,8 @@ func (m model) startRecording() (tea.Model, tea.Cmd) {
 	m.rec = rec
 	m.scr = screenRecording
 
-	cmds := []tea.Cmd{waitMeter(rec.Meter.Ticks), waitRecErr(rec.Err)}
+	m.frameGen++
+	cmds := []tea.Cmd{frameTick(m.frameGen), waitRecErr(rec.Err)}
 	if m.cfg.LiveCaptions {
 		if cap, err := startCaptioner(m.cfg.Device); err != nil {
 			m.notice = "live captions unavailable: " + err.Error()
@@ -995,7 +971,7 @@ func (m model) startRecording() (tea.Model, tea.Cmd) {
 			m.micFile = micTarget
 		} else {
 			m.sysCap = sys
-			cmds = append(cmds, waitSysReady(sys), waitSysTick(sys.Ticks))
+			cmds = append(cmds, waitSysReady(sys)) // levels are pulled by the frame clock
 		}
 	}
 	return m, tea.Batch(cmds...)
@@ -1030,7 +1006,8 @@ func (m model) startArmed() (tea.Model, tea.Cmd) {
 	m.armStart = time.Now()
 	m.mark = time.Time{}
 	m.scr = screenArmed
-	return m, waitMeter(meter.Ticks)
+	m.frameGen++
+	return m, frameTick(m.frameGen)
 }
 
 // --- armed ---

@@ -174,7 +174,7 @@ func (m model) viewLive() string {
 	}
 	hCells := m.height - 13
 	if m.captioner != nil {
-		hCells -= 4 // leave room for the caption block
+		hCells -= 6 // leave room for the caption block
 	}
 	if hCells > 14 {
 		hCells = 14
@@ -294,8 +294,8 @@ func (m model) viewLive() string {
 		for _, c := range m.captions {
 			capLines = append(capLines, wrapText(c, width)...)
 		}
-		if len(capLines) > 4 {
-			capLines = capLines[len(capLines)-4:]
+		if len(capLines) > 6 {
+			capLines = capLines[len(capLines)-6:]
 		}
 		if len(capLines) == 0 {
 			parts = append(parts, labelStyle.Render("live  ")+dimStyle.Render("(captions warming up…)"))
