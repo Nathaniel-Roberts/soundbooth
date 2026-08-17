@@ -67,6 +67,12 @@ fn build_rev() -> &'static str {
 pub fn draw(f: &mut Frame, app: &mut App) {
     let th = app.theme;
     let area = f.area();
+    // paint the theme's own background so the app looks right in any
+    // terminal (and the Catppuccin flavours are actually visible)
+    f.render_widget(
+        Block::default().style(Style::default().bg(th.base).fg(th.text)),
+        area,
+    );
     let header = Line::from(vec![
         Span::styled("soundbooth", Style::default().fg(th.mauve).add_modifier(Modifier::BOLD)),
         Span::styled(format!("  record · meter · transcribe  ·  {}", build_rev()), dim(&th)),
@@ -264,34 +270,7 @@ fn draw_live(f: &mut Frame, app: &mut App, body: Rect) {
         .filter(|&c| c < w_cells)
         .collect();
 
-    // panel: wave + 2 ruler rows
-    let panel_h = wave_h + 2 + 2;
-    let panel = Rect { height: panel_h.min(body.height), ..body };
-    let mut block = panel_block(&th);
-    if app.clip_ticks > 0 {
-        block = block.border_style(Style::default().fg(th.red));
-    }
-    let inner = Rect {
-        x: panel.x + 2,
-        y: panel.y + 1,
-        width: panel.width.saturating_sub(4).min(w_cells as u16),
-        height: panel.height.saturating_sub(2),
-    };
-    f.render_widget(block, panel);
-    let wave_area = Rect { height: wave_h.min(inner.height), ..inner };
-    if app.cfg.channels == 2 || app.sys.is_some() {
-        render_wave_stereo(f.buffer_mut(), wave_area, &cols, &th, None);
-    } else {
-        render_wave(f.buffer_mut(), wave_area, &cols, &th, None);
-    }
-    let [marks, labels] = ruler_lines(inner.width as usize, cell_ms, &marker_cells, &th);
-    f.render_widget(
-        Paragraph::new(vec![marks, labels]),
-        Rect { y: inner.y + wave_h, height: 2.min(inner.height.saturating_sub(wave_h)), ..inner },
-    );
-
-    // status + vu + captions + hints below the panel
-    let mut lines: Vec<Line> = Vec::new();
+    // badge + detail live in the panel's frame now
     let (badge, badge_style, detail): (String, Style, String) = if app.screen == Screen::Armed && app.spool.is_none() {
         ("● STANDBY".into(), warn(&th), "no buffer — nothing is recorded until you press enter".into())
     } else if app.screen == Screen::Armed {
@@ -310,7 +289,7 @@ fn draw_live(f: &mut Frame, app: &mut App, body: Rect) {
             "● REC".into(),
             err(&th),
             format!(
-                "{} + the {} min before the trigger  ·  {}",
+                "{} + the {} min before the trigger · {}",
                 fmt_dur(app.mark.map(|m| m.elapsed()).unwrap_or_default()),
                 app.cfg.buffer_min,
                 app.file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
@@ -319,28 +298,63 @@ fn draw_live(f: &mut Frame, app: &mut App, body: Rect) {
     } else {
         let paused = app.capture.as_ref().map(|c| c.paused()).unwrap_or(false);
         let size = app.capture.as_ref().map(|c| c.file_size()).unwrap_or(0);
-        let src = if app.sys.is_some() { "mic ▲ + system ▼  ·  " } else { "" };
         let name = app.file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let elapsed = fmt_dur(app.capture.as_ref().map(|c| c.elapsed()).unwrap_or_default());
         if paused {
-            (
-                "● PAUSED".into(),
-                warn(&th),
-                format!("{} recorded  ·  {}  {}", fmt_dur(app.capture.as_ref().unwrap().elapsed()), name, human_size(size)),
-            )
+            ("● PAUSED".into(), warn(&th), format!("{elapsed} recorded · {name} · {}", human_size(size)))
         } else {
-            (
-                "● REC".into(),
-                err(&th),
-                format!(
-                    "{src}{}  ·  {}  {}",
-                    fmt_dur(app.capture.as_ref().map(|c| c.elapsed()).unwrap_or_default()),
-                    name,
-                    human_size(size)
-                ),
-            )
+            ("● REC".into(), err(&th), format!("{elapsed} · {name} · {}", human_size(size)))
         }
     };
 
+    // panel: wave + 2 ruler rows, framed with a level-reactive border
+    let panel_h = wave_h + 2 + 2;
+    let panel = Rect { height: panel_h.min(body.height), ..body };
+    let border = if app.clip_ticks > 0 {
+        th.red
+    } else {
+        crate::theme::mix(th.surface0, th.blue, app.vu_level * 0.6)
+    };
+    let block = panel_block(&th)
+        .border_style(Style::default().fg(border))
+        .title(Line::from(vec![
+            Span::styled(format!(" {badge} "), badge_style.add_modifier(Modifier::BOLD)),
+            Span::styled(format!("{detail} "), dim(&th)),
+        ]))
+        .title_bottom(Line::from(Span::styled(
+            format!(" {cell_ms} ms/cell · +/- zoom "),
+            dim(&th),
+        )).right_aligned());
+    let inner = Rect {
+        x: panel.x + 2,
+        y: panel.y + 1,
+        width: panel.width.saturating_sub(4).min(w_cells as u16),
+        height: panel.height.saturating_sub(2),
+    };
+    f.render_widget(block, panel);
+    let wave_area = Rect { height: wave_h.min(inner.height), ..inner };
+    let stereo = app.cfg.channels == 2 || app.sys.is_some();
+    if stereo {
+        render_wave_stereo(f.buffer_mut(), wave_area, &cols, &th, None);
+    } else {
+        render_wave(f.buffer_mut(), wave_area, &cols, &th, None);
+    }
+    // lane labels
+    if stereo && wave_area.height >= 6 {
+        let (top_lab, bot_lab) = if app.sys.is_some() { ("mic ▲", "system ▼") } else { ("L", "R") };
+        let lane = wave_area.height / 2;
+        let style = Style::default().fg(th.overlay1);
+        f.buffer_mut().set_string(wave_area.x + 1, wave_area.y, top_lab, style);
+        f.buffer_mut().set_string(wave_area.x + 1, wave_area.y + lane, bot_lab, style);
+    }
+    let [marks, labels] = ruler_lines(inner.width as usize, cell_ms, &marker_cells, &th);
+    f.render_widget(
+        Paragraph::new(vec![marks, labels]),
+        Rect { y: inner.y + wave_h, height: 2.min(inner.height.saturating_sub(wave_h)), ..inner },
+    );
+
+    // level meter + advice + captions + hints below the panel
+    let mut lines: Vec<Line> = Vec::new();
     let (level_style, advice) = if app.clip_ticks > 0 {
         (err(&th), format!("CLIPPING ({}) — gain down", app.clips))
     } else if app.rmaxdb > -5.0 {
@@ -350,17 +364,12 @@ fn draw_live(f: &mut Frame, app: &mut App, body: Rect) {
     } else {
         (ok(&th), "level OK".into())
     };
-    lines.push(Line::from(vec![
-        Span::styled(badge, badge_style),
-        Span::raw("  "),
-        Span::styled(format!("peak {:.0} dB  {advice}", app.rmaxdb), level_style),
-        Span::raw("  "),
-        Span::styled(detail, dim(&th)),
-    ]));
-
     let hold = ((app.rmaxdb - DB_FLOOR) / -DB_FLOOR).clamp(0.0, 1.0);
-    let vu_w = (w_cells.saturating_sub(30)).clamp(16, 60);
-    lines.push(vu_line(vu_w, app.vu_level, hold, &th));
+    let vu_w = (w_cells / 2).clamp(16, 48);
+    let mut vu = vu_line(vu_w, app.vu_level, hold, &th);
+    vu.spans.push(Span::raw("  "));
+    vu.spans.push(Span::styled(advice, level_style));
+    lines.push(vu);
 
     if app.captioner.is_some() {
         let width = (body.width as usize).saturating_sub(10).max(30);

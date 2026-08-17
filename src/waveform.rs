@@ -140,12 +140,17 @@ pub fn render_wave(
             }
             let colour = if cell_clip {
                 th.red
-            } else if cell_paused || cell_max_env <= 1 {
+            } else if cell_paused {
                 th.overlay0
-            } else if cell_core {
-                core_colour
+            } else if cell_max_env <= 1 {
+                // idle hairline: fixed subtle grey
+                mix(th.base, th.overlay0, 0.7)
             } else {
-                env_colour
+                // amplitude glow: loud columns burn bright, quiet ones
+                // recede toward the background
+                let base_colour = if cell_core { core_colour } else { env_colour };
+                let boost = (0.35 + 0.65 * (cell_max_env as f64 / half as f64)).clamp(0.0, 1.0);
+                mix(th.base, base_colour, boost)
             };
             let c = char::from_u32(0x2800 + bits).unwrap_or('⣿');
             cell.set_char(c).set_fg(colour);
@@ -225,6 +230,7 @@ pub fn ruler_lines(w_cells: usize, cell_ms: usize, marker_cells: &[usize], th: &
 }
 
 /// Gradient VU bar with a peak-hold marker; level and hold are 0..1.
+/// Slim dotted track so it reads as a meter, not a slab.
 pub fn vu_line(width: usize, level: f64, hold: f64, th: &Theme) -> Line<'static> {
     let width = width.max(10);
     let fill = (level * width as f64 + 0.5) as usize;
@@ -233,11 +239,11 @@ pub fn vu_line(width: usize, level: f64, hold: f64, th: &Theme) -> Line<'static>
     for i in 0..width {
         let t = i as f64 / (width - 1) as f64;
         let (ch, colour) = if i == hold_pos && hold > 0.01 {
-            ("▐", th.text)
+            ("▌", th.text)
         } else if i < fill {
             ("█", th.vu_ramp(t))
         } else {
-            ("░", th.surface0)
+            ("·", th.surface0)
         };
         spans.push(Span::styled(ch, Style::default().fg(colour)));
     }
