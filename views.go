@@ -173,6 +173,9 @@ func (m model) viewLive() string {
 		wCells = 60
 	}
 	hCells := m.height - 13
+	if m.captioner != nil {
+		hCells -= 4 // leave room for the caption block
+	}
 	if hCells > 14 {
 		hCells = 14
 	}
@@ -283,22 +286,31 @@ func (m model) viewLive() string {
 	status := badge + "  " + level + "  " + detail
 	parts := []string{panel.Render(wave), status, vu}
 	if m.captioner != nil {
-		if len(m.captions) == 0 {
-			parts = append(parts, dimStyle.Render("live: (captions warming up…)"))
+		width := m.width - 10
+		if width < 30 {
+			width = 30
+		}
+		var capLines []string
+		for _, c := range m.captions {
+			capLines = append(capLines, wrapText(c, width)...)
+		}
+		if len(capLines) > 4 {
+			capLines = capLines[len(capLines)-4:]
+		}
+		if len(capLines) == 0 {
+			parts = append(parts, labelStyle.Render("live  ")+dimStyle.Render("(captions warming up…)"))
 		} else {
-			show := m.captions
-			if len(show) > 2 {
-				show = show[len(show)-2:]
-			}
-			for i, cline := range show {
-				if len(cline) > m.width-12 && m.width > 20 {
-					cline = cline[:m.width-12] + "…"
-				}
-				label := "     "
+			for i, cline := range capLines {
+				label := "      "
 				if i == 0 {
-					label = "live:"
+					label = "live  "
 				}
-				parts = append(parts, labelStyle.Render(label)+" "+dimStyle.Render(cline))
+				// newest line bright, older lines progressively dimmer
+				style := valueStyle
+				if i < len(capLines)-1 {
+					style = labelStyle
+				}
+				parts = append(parts, labelStyle.Render(label)+style.Render(cline))
 			}
 		}
 	}
@@ -312,6 +324,25 @@ func (m model) viewLive() string {
 	}
 	parts = append(parts, "", hints)
 	return lipgloss.JoinVertical(lipgloss.Left, parts...)
+}
+
+// wrapText word-wraps s to width columns.
+func wrapText(s string, width int) []string {
+	words := strings.Fields(s)
+	if len(words) == 0 {
+		return nil
+	}
+	var out []string
+	line := words[0]
+	for _, w := range words[1:] {
+		if len(line)+1+len(w) > width {
+			out = append(out, line)
+			line = w
+			continue
+		}
+		line += " " + w
+	}
+	return append(out, line)
 }
 
 func fmtDur(d time.Duration) string {
@@ -388,16 +419,22 @@ func renderProgress(width int, frac float64) string {
 		frac = 1
 	}
 	fill := int(frac*float64(width) + 0.5)
+	colours := progColours(width)
+	emptyEsc := fgEsc(th.Surface0)
 	var b strings.Builder
+	lastEsc := ""
 	for i := 0; i < width; i++ {
+		esc, glyph := emptyEsc, "░"
 		if i < fill {
-			t := float64(i) / float64(width-1)
-			b.WriteString(lipgloss.NewStyle().
-				Foreground(lipgloss.Color(waveRamp(t))).Render("█"))
-		} else {
-			b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color(th.Surface0)).Render("░"))
+			esc, glyph = colours[i], "█"
 		}
+		if esc != lastEsc {
+			b.WriteString(esc)
+			lastEsc = esc
+		}
+		b.WriteString(glyph)
 	}
+	b.WriteString(ansiReset)
 	return b.String()
 }
 

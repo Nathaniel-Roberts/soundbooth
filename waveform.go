@@ -4,8 +4,6 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
-
-	"github.com/charmbracelet/lipgloss"
 )
 
 // waveCol is one rendered sub-column (one meter tick = one Braille dot
@@ -66,6 +64,75 @@ func vuRamp(t float64) string {
 var brailleBits = [2][4]int{
 	{0x01, 0x02, 0x04, 0x40},
 	{0x08, 0x10, 0x20, 0x80},
+}
+
+// --- hot-path colour caches ---
+// The live view repaints up to 40x/second; building lipgloss styles per
+// colour run allocates heavily and made the UI stutter. The renderers
+// below write raw truecolor escapes from these caches instead (safe: the
+// program forces the truecolor profile at startup).
+
+const ansiReset = "\x1b[0m"
+
+var fgCache = map[string]string{}
+
+func fgEsc(hex string) string {
+	if e, ok := fgCache[hex]; ok {
+		return e
+	}
+	r, g, b := hexRGB(hex)
+	e := fmt.Sprintf("\x1b[38;2;%d;%d;%dm", r, g, b)
+	fgCache[hex] = e
+	return e
+}
+
+type rampKey struct{ gen, half, outer int }
+
+var rampCache = map[rampKey][2]string{}
+
+// rowEscs returns the cached envelope and core escapes for a wave row.
+func rowEscs(half, outer int) (string, string) {
+	k := rampKey{renderGen, half, outer}
+	if v, ok := rampCache[k]; ok {
+		return v[0], v[1]
+	}
+	t := float64(outer) / float64(half)
+	env := waveRamp(t)
+	v := [2]string{fgEsc(env), fgEsc(mixHex(env, th.Text, 0.45))}
+	rampCache[k] = v
+	return v[0], v[1]
+}
+
+type barKey struct{ gen, width int }
+
+var vuColourCache = map[barKey][]string{}
+
+func vuColours(width int) []string {
+	k := barKey{renderGen, width}
+	if v, ok := vuColourCache[k]; ok {
+		return v
+	}
+	v := make([]string, width)
+	for i := range v {
+		v[i] = fgEsc(vuRamp(float64(i) / float64(width-1)))
+	}
+	vuColourCache[k] = v
+	return v
+}
+
+var progColourCache = map[barKey][]string{}
+
+func progColours(width int) []string {
+	k := barKey{renderGen, width}
+	if v, ok := progColourCache[k]; ok {
+		return v
+	}
+	v := make([]string, width)
+	for i := range v {
+		v[i] = fgEsc(waveRamp(float64(i) / float64(width-1)))
+	}
+	progColourCache[k] = v
+	return v
 }
 
 // renderWaveStereo draws two stacked lanes (L over R) within hCells rows.
@@ -135,10 +202,12 @@ func renderWaveHead(cols []waveCol, wCells, hCells int, playhead int) string {
 		env[i] = 1
 	}
 
-	clipHex := th.Red
-	greyHex := th.Overlay0
+	clipEsc := fgEsc(th.Red)
+	greyEsc := fgEsc(th.Overlay0)
+	headEsc := fgEsc(th.Text)
 
 	var b strings.Builder
+	b.Grow(hCells * wCells * 4)
 	for row := 0; row < hCells; row++ {
 		// Row gradient position: outermost dot's distance from centre.
 		outer := 0
@@ -154,30 +223,16 @@ func renderWaveHead(cols []waveCol, wCells, hCells int, playhead int) string {
 				outer = dist + 1
 			}
 		}
-		t := float64(outer) / float64(half)
-		envHex := waveRamp(t)
-		coreHex := mixHex(envHex, th.Text, 0.45)
+		envEsc, coreEsc := rowEscs(half, outer)
 
-		var line strings.Builder
-		lastHex := ""
-		var run strings.Builder
-		flush := func() {
-			if run.Len() > 0 {
-				if lastHex == "" {
-					line.WriteString(run.String())
-				} else {
-					line.WriteString(lipgloss.NewStyle().
-						Foreground(lipgloss.Color(lastHex)).Render(run.String()))
-				}
-				run.Reset()
+		lastEsc := ""
+		emit := func(esc string, r rune) {
+			// spaces render identically in any colour: never switch for them
+			if r != ' ' && esc != lastEsc {
+				b.WriteString(esc)
+				lastEsc = esc
 			}
-		}
-		emit := func(hex string, r rune) {
-			if hex != lastHex {
-				flush()
-				lastHex = hex
-			}
-			run.WriteRune(r)
+			b.WriteRune(r)
 		}
 
 		for cx := 0; cx < wCells; cx++ {
@@ -216,26 +271,25 @@ func renderWaveHead(cols []waveCol, wCells, hCells int, playhead int) string {
 			if cx == playhead {
 				// player cursor: a bright full-height dot column
 				c := rune(0x2800 + (bits | 0x01 | 0x02 | 0x04 | 0x40))
-				emit(th.Text, c)
+				emit(headEsc, c)
 				continue
 			}
 			if bits == 0 {
-				emit(lastHex, ' ')
+				emit(lastEsc, ' ')
 				continue
 			}
-			hex := envHex
+			esc := envEsc
 			switch {
 			case cellClip:
-				hex = clipHex
+				esc = clipEsc
 			case cellPaused, cellMaxEnv <= 1: // paused spans and the idle hairline
-				hex = greyHex
+				esc = greyEsc
 			case cellCore:
-				hex = coreHex
+				esc = coreEsc
 			}
-			emit(hex, rune(0x2800+bits))
+			emit(esc, rune(0x2800+bits))
 		}
-		flush()
-		b.WriteString(line.String())
+		b.WriteString(ansiReset)
 		if row < hCells-1 {
 			b.WriteByte('\n')
 		}
@@ -297,24 +351,30 @@ func renderRuler(wCells, cellMs int, markerCells []int) string {
 	line := dimStyle.Render(string(marks))
 	// overlay marker arrows in mauve
 	if len(markerCells) > 0 {
-		markRunes := []rune(string(marks))
 		overlay := make([]bool, wCells)
 		for _, back := range markerCells {
 			pos := wCells - 1 - back
 			if pos >= 0 && pos < wCells {
-				markRunes[pos] = '▼'
+				marks[pos] = '▼'
 				overlay[pos] = true
 			}
 		}
+		dimEsc := fgEsc(th.Overlay0)
+		mauveEsc := fgEsc(th.Mauve)
 		var b strings.Builder
-		for i, r := range markRunes {
+		lastEsc := ""
+		for i, r := range marks {
+			esc := dimEsc
 			if overlay[i] {
-				b.WriteString(lipgloss.NewStyle().
-					Foreground(lipgloss.Color(th.Mauve)).Render(string(r)))
-			} else {
-				b.WriteString(dimStyle.Render(string(r)))
+				esc = mauveEsc
 			}
+			if esc != lastEsc {
+				b.WriteString(esc)
+				lastEsc = esc
+			}
+			b.WriteRune(r)
 		}
+		b.WriteString(ansiReset)
 		line = b.String()
 	}
 	return line + "\n" + dimStyle.Render(string(labels))
@@ -370,21 +430,30 @@ func renderVU(width int, level, hold float64) string {
 	if holdPos >= width {
 		holdPos = width - 1
 	}
+	colours := vuColours(width)
+	emptyEsc := fgEsc(th.Surface0)
+	textEsc := fgEsc(th.Text)
 	var b strings.Builder
+	b.Grow(width * 16)
+	lastEsc := ""
 	for i := 0; i < width; i++ {
-		t := float64(i) / float64(width-1)
+		var esc string
+		var glyph string
 		switch {
 		case i == holdPos && hold > 0.01:
-			b.WriteString(lipgloss.NewStyle().
-				Foreground(lipgloss.Color(th.Text)).Render("▐"))
+			esc, glyph = textEsc, "▐"
 		case i < fill:
-			b.WriteString(lipgloss.NewStyle().
-				Foreground(lipgloss.Color(vuRamp(t))).Render("█"))
+			esc, glyph = colours[i], "█"
 		default:
-			b.WriteString(lipgloss.NewStyle().
-				Foreground(lipgloss.Color(th.Surface0)).Render("░"))
+			esc, glyph = emptyEsc, "░"
 		}
+		if esc != lastEsc {
+			b.WriteString(esc)
+			lastEsc = esc
+		}
+		b.WriteString(glyph)
 	}
+	b.WriteString(ansiReset)
 	db := dbFloor * (1 - hold)
 	return b.String() + dimStyle.Render(fmt.Sprintf(" %4.0f dB", db))
 }

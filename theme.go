@@ -120,8 +120,12 @@ var (
 	descStyle  lipgloss.Style
 )
 
+// renderGen invalidates the render colour caches on theme change.
+var renderGen int
+
 func applyTheme(t Theme) {
 	th = t
+	renderGen++
 	titleStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(t.Mauve))
 	dimStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(t.Overlay0))
 	labelStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(t.Subtext0))

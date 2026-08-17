@@ -90,6 +90,17 @@ func TestWaveGradientColours(t *testing.T) {
 	}
 }
 
+func BenchmarkRenderWaveFrame(b *testing.B) {
+	cols := make([]waveCol, 400)
+	for i := range cols {
+		cols[i] = waveCol{rms: 0.3 + 0.3*float64(i%7)/7, peak: 0.5 + 0.4*float64(i%11)/11}
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_ = renderWaveHead(cols, 200, 14, -1)
+	}
+}
+
 func TestLvlMapping(t *testing.T) {
 	if lvl(0) != 0 {
 		t.Errorf("lvl(0) = %v, want 0", lvl(0))

@@ -436,7 +436,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case sysTickMsg:
 		m.sysLevel = MeterTick(msg)
 		if m.sysCap != nil {
-			return m, waitSysTick(m.sysCap.Ticks)
+			ch := m.sysCap.Ticks
+		drainSys:
+			for i := 0; i < 60; i++ {
+				select {
+				case t, ok := <-ch:
+					if !ok {
+						break drainSys
+					}
+					m.sysLevel = t
+				default:
+					break drainSys
+				}
+			}
+			return m, waitSysTick(ch)
 		}
 		return m, nil
 
@@ -445,8 +458,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case captionMsg:
 		m.captions = append(m.captions, string(msg))
-		if len(m.captions) > 3 {
-			m.captions = m.captions[len(m.captions)-3:]
+		if len(m.captions) > 6 {
+			m.captions = m.captions[len(m.captions)-6:]
 		}
 		if m.captioner != nil {
 			return m, waitCaption(m.captioner.Lines)
@@ -460,49 +473,24 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.scr != screenRecording && m.scr != screenArmed {
 			return m, nil
 		}
-		t := MeterTick(msg)
-		col := waveCol{rms: t.RMS, peak: t.Peak, rmsR: t.RMSR, peakR: t.PeakR, clip: t.Clip}
-		if m.sysCap != nil {
-			// stereo lanes become mic (top) and system audio (bottom)
-			col.rmsR = m.sysLevel.RMS
-			col.peakR = m.sysLevel.Peak
-			col.clip = col.clip || m.sysLevel.Clip
-			if m.sysLevel.DB > t.DB {
-				t.DB = m.sysLevel.DB
+		m.applyTick(MeterTick(msg))
+		// Drain any backlog in one update: if a frame ran slow (GPU busy
+		// with captions/transcription), queued ticks otherwise arrive one
+		// repaint each and the waveform lags and lurches behind live.
+		ch := m.ticks()
+	drain:
+		for i := 0; i < 60; i++ {
+			select {
+			case t, ok := <-ch:
+				if !ok {
+					break drain
+				}
+				m.applyTick(t)
+			default:
+				break drain
 			}
 		}
-		if m.rec != nil && m.rec.Paused() {
-			col.paused = true
-			col.clip = false
-		}
-		m.wave = append(m.wave, col)
-		if len(m.wave) > 8192 {
-			m.wave = m.wave[len(m.wave)-4096:]
-		}
-		m.rmaxdb -= 0.5 // decays 10 dB/s at 20 ticks/s
-		if t.DB > m.rmaxdb {
-			m.rmaxdb = t.DB
-		}
-		target := t.Peak
-		if t.PeakR > target {
-			target = t.PeakR
-		}
-		if target > m.vuLevel {
-			m.vuLevel = target
-		} else {
-			m.vuLevel *= 0.82
-		}
-		if col.clip {
-			m.clips++
-			m.clipTicks = 40
-		} else if m.clipTicks > 0 {
-			m.clipTicks--
-		}
-		if m.diskTick++; m.diskTick >= 100 { // every ~5 s
-			m.diskTick = 0
-			m.diskFree = freeBytes(m.cfg.OutDir)
-		}
-		return m, waitMeter(m.ticks())
+		return m, waitMeter(ch)
 
 	case meterClosedMsg:
 		// The metering stream died (device change?). Try to revive it so
@@ -644,6 +632,51 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.updateSpeakerEdit(msg)
 	}
 	return m, nil
+}
+
+// applyTick folds one 50 ms meter tick into the live-view state.
+func (m *model) applyTick(t MeterTick) {
+	col := waveCol{rms: t.RMS, peak: t.Peak, rmsR: t.RMSR, peakR: t.PeakR, clip: t.Clip}
+	if m.sysCap != nil {
+		// stereo lanes become mic (top) and system audio (bottom)
+		col.rmsR = m.sysLevel.RMS
+		col.peakR = m.sysLevel.Peak
+		col.clip = col.clip || m.sysLevel.Clip
+		if m.sysLevel.DB > t.DB {
+			t.DB = m.sysLevel.DB
+		}
+	}
+	if m.rec != nil && m.rec.Paused() {
+		col.paused = true
+		col.clip = false
+	}
+	m.wave = append(m.wave, col)
+	if len(m.wave) > 8192 {
+		m.wave = m.wave[len(m.wave)-4096:]
+	}
+	m.rmaxdb -= 0.5 // decays 10 dB/s at 20 ticks/s
+	if t.DB > m.rmaxdb {
+		m.rmaxdb = t.DB
+	}
+	target := t.Peak
+	if t.PeakR > target {
+		target = t.PeakR
+	}
+	if target > m.vuLevel {
+		m.vuLevel = target
+	} else {
+		m.vuLevel *= 0.82
+	}
+	if col.clip {
+		m.clips++
+		m.clipTicks = 40
+	} else if m.clipTicks > 0 {
+		m.clipTicks--
+	}
+	if m.diskTick++; m.diskTick >= 100 { // every ~5 s
+		m.diskTick = 0
+		m.diskFree = freeBytes(m.cfg.OutDir)
+	}
 }
 
 // teardown stops every live process. Recordings in flight are finalised;
