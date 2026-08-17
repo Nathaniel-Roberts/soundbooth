@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"math"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -91,6 +92,9 @@ func (m model) viewSetup() string {
 			labelStyle.Render(fmt.Sprintf("%-14s", r.label)), style.Render(r.value)))
 	}
 	out := panelStyle.Render(strings.TrimRight(b.String(), "\n"))
+	if m.cursor == fieldTheme {
+		out = lipgloss.JoinVertical(lipgloss.Left, out, themePreview(m.width))
+	}
 	var notes []string
 	if len(m.orphans) > 0 {
 		o := m.orphans[0]
@@ -108,6 +112,36 @@ func (m model) viewSetup() string {
 	parts := append([]string{out}, notes...)
 	parts = append(parts, "", hints)
 	return lipgloss.JoinVertical(lipgloss.Left, parts...)
+}
+
+// themePreview renders a synthetic waveform, VU bar and palette swatches
+// so cycling the Theme field shows exactly what each flavour looks like.
+func themePreview(width int) string {
+	wCells := 46
+	if width > 0 && width-10 < wCells {
+		wCells = width - 10
+	}
+	if wCells < 20 {
+		wCells = 20
+	}
+	cols := make([]waveCol, wCells*2)
+	for i := range cols {
+		x := float64(i)
+		p := 0.15 + 0.85*math.Abs(math.Sin(x/6.5))*math.Abs(math.Sin(x/23))
+		cols[i] = waveCol{peak: p, rms: p * 0.55}
+	}
+	// show the clip colour too
+	for i := len(cols) * 3 / 4; i < len(cols)*3/4+3 && i < len(cols); i++ {
+		cols[i].clip = true
+	}
+	wave := renderWave(cols, wCells, 4)
+
+	var sw strings.Builder
+	for _, hex := range []string{th.Lavender, th.Blue, th.Sapphire, th.Green, th.Yellow, th.Red, th.Mauve, th.Text, th.Overlay0} {
+		sw.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color(hex)).Render("● "))
+	}
+	body := wave + "\n" + renderVU(wCells-9, 0.62, 0.8) + "\n" + sw.String()
+	return panelStyle.Render(body)
 }
 
 // --- live (armed + recording) ---
