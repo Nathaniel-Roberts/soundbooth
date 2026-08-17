@@ -14,15 +14,17 @@
     in
     {
       packages = forSystems (pkgs: rec {
-        soundbooth = pkgs.buildGoModule {
+        soundbooth = pkgs.rustPlatform.buildRustPackage {
           pname = "soundbooth";
-          version = "0.3.0";
+          version = "0.4.0";
           src = ./.;
-          vendorHash = "sha256-HsV9tFxW9vLAFHgVFrBopSqgdN/wAN1ss734rPQMbNM=";
+          cargoLock.lockFile = ./Cargo.lock;
           nativeBuildInputs = [ pkgs.makeWrapper ];
-          # sox and ffmpeg do the capture; pin them onto PATH so the binary
-          # works from a bare environment. whispermlx cannot come from nix
-          # (nixpkgs MLX is CPU-only) — install it with uv, see the README.
+          env.SB_REV = self.shortRev or self.dirtyShortRev or "unknown";
+          # sox encodes/plays and ffmpeg drives the armed-mode buffer; pin
+          # both onto PATH so the binary works from a bare environment.
+          # whispermlx cannot come from nix (nixpkgs MLX is CPU-only) —
+          # install it with uv, see the README.
           postInstall = ''
             wrapProgram $out/bin/soundbooth \
               --prefix PATH : ${

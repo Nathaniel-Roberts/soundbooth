@@ -29,7 +29,7 @@ Run `soundbooth doctor` to check all of the above.
 ```
 nix profile install .#soundbooth    # or add the flake to your config
 # or
-go build -o soundbooth . && ./soundbooth
+cargo build --release && ./target/release/soundbooth
 ```
 
 ## CLI
@@ -117,27 +117,32 @@ alone.
 
 ## Architecture
 
-Pure orchestration — no cgo. Multiple processes share the input device
-(coreaudio allows shared input):
+Rust + ratatui, with **native in-process audio capture** (cpal /
+CoreAudio): the realtime callback hands samples to a writer thread that
+does the 25 ms metering, live-caption decimation, and FLAC encoding —
+no pipes on the capture path, so the meter is sample-accurate and the
+display runs on a fixed 40 Hz frame clock with cell-level diffing.
 
-- **Record mode**: sox writes 48 kHz FLAC segments (segments make pause
-  cheap and safe; stop concatenates them).
+- **Record mode**: the writer streams PCM into sox for FLAC encode, in
+  segments (pause is cheap and safe; stop concatenates; crashes are
+  recoverable from the segment dir).
 - **Armed mode**: ffmpeg's segment muxer spools gapless 60 s FLAC
   segments to a temp dir; a janitor deletes anything older than the
   buffer window until a save is triggered. Disarming wipes the spool —
   nothing is retained without an explicit save.
-- **Metering**: a sox `-t dat` text-sample stream folded into 50 ms
-  RMS/peak/clip ticks per channel for the renderer.
+- **System audio**: a small embedded ScreenCaptureKit Swift helper,
+  compiled once on first use.
 
 Transcription shells out to whispermlx with `PYTHONWARNINGS=ignore`
 (torchcodec in that env can't load against torch 2.8; pyannote falls back
-to its own loader).
+to its own loader). Live captions run a persistent python daemon keeping
+a small whisper model warm on the GPU.
 
 ## Tests
 
 ```
-go test ./...                          # render + mapping tests
-SOUNDBOOTH_HW_TEST=1 go test -v ./...  # plus a real 3 s microphone capture
+cargo test                                              # logic + file-format tests
+SOUNDBOOTH_HW_TEST=1 cargo test -- --test-threads=1     # plus real microphone captures
 ```
 
 ## Licence

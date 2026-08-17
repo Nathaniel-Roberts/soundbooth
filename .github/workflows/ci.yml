@@ -9,11 +9,9 @@ jobs:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-go@v6
-        with:
-          go-version: "1.26"
-      - run: go build ./...
-      - run: go vet ./...
-      # hardware (microphone) tests are gated behind SOUNDBOOTH_HW_TEST=1
-      # and skip themselves on CI
-      - run: go test ./...
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release
+      - run: cargo clippy -- -D warnings -A clippy::needless_range_loop -A clippy::collapsible_match -A clippy::explicit_counter_loop -A clippy::collapsible_if
+      # hardware (microphone) tests gate behind SOUNDBOOTH_HW_TEST=1 and
+      # skip themselves on CI
+      - run: cargo test
