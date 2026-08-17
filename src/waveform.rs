@@ -64,6 +64,7 @@ pub fn render_wave(
     cols: &[WaveCol],
     th: &Theme,
     playhead: Option<u16>,
+    marks: &[u16],
 ) {
     let w_cells = area.width as usize;
     let h_cells = area.height as usize;
@@ -134,6 +135,12 @@ pub fn render_wave(
                 cell.set_char(c).set_fg(th.text);
                 continue;
             }
+            if marks.contains(&(cx as u16)) {
+                // marker: full-height mauve hairline through the wave
+                let c = char::from_u32(0x2800 + (bits | 0x01 | 0x02 | 0x04 | 0x40)).unwrap_or('⡇');
+                cell.set_char(c).set_fg(th.mauve);
+                continue;
+            }
             if bits == 0 {
                 cell.set_char(' ');
                 continue;
@@ -144,7 +151,7 @@ pub fn render_wave(
                 th.overlay0
             } else if cell_max_env <= 1 {
                 // idle hairline: fixed subtle grey
-                mix(th.base, th.overlay0, 0.7)
+                mix(th.base, th.overlay0, 0.5)
             } else {
                 // amplitude glow: loud columns burn bright, quiet ones
                 // recede toward the background
@@ -159,10 +166,17 @@ pub fn render_wave(
 }
 
 /// Two stacked lanes (mic/L over system/R).
-pub fn render_wave_stereo(buf: &mut Buffer, area: Rect, cols: &[WaveCol], th: &Theme, playhead: Option<u16>) {
+pub fn render_wave_stereo(
+    buf: &mut Buffer,
+    area: Rect,
+    cols: &[WaveCol],
+    th: &Theme,
+    playhead: Option<u16>,
+    marks: &[u16],
+) {
     let lane = area.height / 2;
     if lane < 3 {
-        render_wave(buf, area, cols, th, playhead);
+        render_wave(buf, area, cols, th, playhead, marks);
         return;
     }
     let right: Vec<WaveCol> = cols
@@ -171,8 +185,8 @@ pub fn render_wave_stereo(buf: &mut Buffer, area: Rect, cols: &[WaveCol], th: &T
         .collect();
     let top = Rect { height: lane, ..area };
     let bottom = Rect { y: area.y + lane, height: lane, ..area };
-    render_wave(buf, top, cols, th, playhead);
-    render_wave(buf, bottom, &right, th, playhead);
+    render_wave(buf, top, cols, th, playhead, marks);
+    render_wave(buf, bottom, &right, th, playhead, marks);
 }
 
 /// DAW-style time ruler: marks every 5/15 s back from the right edge,

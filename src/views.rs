@@ -234,7 +234,7 @@ fn draw_theme_preview(f: &mut Frame, app: &App, area: Rect) {
         c.clip = true;
     }
     let wave_area = Rect { height: 4, ..inner };
-    render_wave(f.buffer_mut(), wave_area, &cols, &th, None);
+    render_wave(f.buffer_mut(), wave_area, &cols, &th, None, &[]);
     let vu = vu_line(inner.width.saturating_sub(9) as usize, 0.62, 0.8, &th);
     f.render_widget(Paragraph::new(vu), Rect { y: inner.y + 5, height: 1, ..inner });
     let mut sw: Vec<Span> = [th.lavender, th.blue, th.sapphire, th.green, th.yellow, th.red, th.mauve, th.text, th.overlay0]
@@ -270,42 +270,39 @@ fn draw_live(f: &mut Frame, app: &mut App, body: Rect) {
         .filter(|&c| c < w_cells)
         .collect();
 
-    // badge + detail live in the panel's frame now
-    let (badge, badge_style, detail): (String, Style, String) = if app.screen == Screen::Armed && app.spool.is_none() {
-        ("● STANDBY".into(), warn(&th), "no buffer — nothing is recorded until you press enter".into())
-    } else if app.screen == Screen::Armed {
-        let sp = app.spool.as_ref().unwrap();
-        (
-            "● ARMED".into(),
-            warn(&th),
-            format!(
-                "buffered {} of last {} min — nothing kept unless you save",
-                fmt_dur(sp.buffered()),
-                app.cfg.buffer_min
-            ),
-        )
-    } else if app.spool.is_some() {
-        (
-            "● REC".into(),
-            err(&th),
-            format!(
-                "{} + the {} min before the trigger · {}",
+    // badge + detail live in the panel's frame; the elapsed time renders
+    // bold and the REC dot pulses
+    let (badge, mut badge_style, strong, detail): (String, Style, String, String) =
+        if app.screen == Screen::Armed && app.spool.is_none() {
+            ("● STANDBY".into(), warn(&th), String::new(),
+                "no buffer — nothing is recorded until you press enter".into())
+        } else if app.screen == Screen::Armed {
+            let sp = app.spool.as_ref().unwrap();
+            ("● ARMED".into(), warn(&th), fmt_dur(sp.buffered()),
+                format!("of last {} min buffered — nothing kept unless you save", app.cfg.buffer_min))
+        } else if app.spool.is_some() {
+            ("● REC".into(), err(&th),
                 fmt_dur(app.mark.map(|m| m.elapsed()).unwrap_or_default()),
-                app.cfg.buffer_min,
-                app.file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
-            ),
-        )
-    } else {
-        let paused = app.capture.as_ref().map(|c| c.paused()).unwrap_or(false);
-        let size = app.capture.as_ref().map(|c| c.file_size()).unwrap_or(0);
-        let name = app.file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        let elapsed = fmt_dur(app.capture.as_ref().map(|c| c.elapsed()).unwrap_or_default());
-        if paused {
-            ("● PAUSED".into(), warn(&th), format!("{elapsed} recorded · {name} · {}", human_size(size)))
+                format!(
+                    "+ the {} min before the trigger · {}",
+                    app.cfg.buffer_min,
+                    app.file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+                ))
         } else {
-            ("● REC".into(), err(&th), format!("{elapsed} · {name} · {}", human_size(size)))
-        }
-    };
+            let paused = app.capture.as_ref().map(|c| c.paused()).unwrap_or(false);
+            let size = app.capture.as_ref().map(|c| c.file_size()).unwrap_or(0);
+            let name = app.file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let elapsed = fmt_dur(app.capture.as_ref().map(|c| c.elapsed()).unwrap_or_default());
+            if paused {
+                ("● PAUSED".into(), warn(&th), elapsed, format!("recorded · {name} · {}", human_size(size)))
+            } else {
+                ("● REC".into(), err(&th), elapsed, format!("· {name} · {}", human_size(size)))
+            }
+        };
+    // slow pulse on the live REC dot (~1 s cycle)
+    if badge == "● REC" && (app.frame / 20) % 2 == 1 {
+        badge_style = Style::default().fg(crate::theme::mix(th.base, th.red, 0.45));
+    }
 
     // panel: wave + 2 ruler rows, framed with a level-reactive border
     let panel_h = wave_h + 2 + 2;
@@ -319,6 +316,7 @@ fn draw_live(f: &mut Frame, app: &mut App, body: Rect) {
         .border_style(Style::default().fg(border))
         .title(Line::from(vec![
             Span::styled(format!(" {badge} "), badge_style.add_modifier(Modifier::BOLD)),
+            Span::styled(format!("{strong} "), value(&th).add_modifier(Modifier::BOLD)),
             Span::styled(format!("{detail} "), dim(&th)),
         ]))
         .title_bottom(Line::from(Span::styled(
@@ -333,11 +331,17 @@ fn draw_live(f: &mut Frame, app: &mut App, body: Rect) {
     };
     f.render_widget(block, panel);
     let wave_area = Rect { height: wave_h.min(inner.height), ..inner };
+    // markers as full-height mauve hairlines through the wave
+    let marks: Vec<u16> = marker_cells
+        .iter()
+        .filter(|&&b| (b as u16) < inner.width)
+        .map(|&b| inner.width - 1 - b as u16)
+        .collect();
     let stereo = app.cfg.channels == 2 || app.sys.is_some();
     if stereo {
-        render_wave_stereo(f.buffer_mut(), wave_area, &cols, &th, None);
+        render_wave_stereo(f.buffer_mut(), wave_area, &cols, &th, None, &marks);
     } else {
-        render_wave(f.buffer_mut(), wave_area, &cols, &th, None);
+        render_wave(f.buffer_mut(), wave_area, &cols, &th, None, &marks);
     }
     // lane labels
     if stereo && wave_area.height >= 6 {
@@ -730,7 +734,13 @@ fn draw_done(f: &mut Frame, app: &mut App, body: Rect) {
         let cur = app.cur_pos();
         let head = ((cur / app.p_dur * w_cells as f64) as u16).min(w_cells.saturating_sub(1));
         let wave_area = Rect { x: body.x + 2, y: y + 1, width: w_cells, height: 7 };
-        render_wave(f.buffer_mut(), wave_area, &app.p_wave, &th, Some(head));
+        let marks: Vec<u16> = app
+            .markers
+            .iter()
+            .map(|m| ((m.as_secs_f64() / app.p_dur) * w_cells as f64) as u16)
+            .filter(|&c| c < w_cells)
+            .collect();
+        render_wave(f.buffer_mut(), wave_area, &app.p_wave, &th, Some(head), &marks);
         let state = if app.playback.is_some() { "▶" } else { "⏸" };
         let mut transport = format!("{state} {} / {}", fmt_clock(cur), fmt_clock(app.p_dur));
         if !app.markers.is_empty() {
