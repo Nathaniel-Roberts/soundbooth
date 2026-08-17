@@ -274,3 +274,28 @@ fn hw_spooler() {
     assert!(std::fs::metadata(&out).unwrap().len() > 0);
     crate::spool::Spooler::cleanup_dir(&dir);
 }
+
+#[test]
+fn json_nan_and_word_speakers() {
+    let dir = tmp_dir("nanjson");
+    let audio = dir.join("meet-20260817-000000.flac");
+    let tx = dir.join("meet-20260817-000000");
+    std::fs::create_dir_all(&tx).unwrap();
+    // real-world whispermlx quirks: bare NaN scores (invalid JSON), one
+    // segment with no segment-level speaker (words only), and "NaN"
+    // appearing inside transcript text
+    let json = r#"{"segments": [
+      {"start": 0.0, "end": 1.0, "text": "My name is Scott.", "avg_logprob": NaN,
+       "speaker": "SPEAKER_01", "words": [{"word": "My", "score": NaN, "speaker": "SPEAKER_01"}]},
+      {"start": 1.0, "end": 2.5, "text": "the value was NaN today",
+       "words": [{"word": "the", "speaker": "SPEAKER_00"}, {"word": "value", "speaker": "SPEAKER_00"}, {"word": "was", "speaker": "SPEAKER_01"}]}
+    ], "language": "en"}"#;
+    std::fs::write(tx.join("meet-20260817-000000.json"), json).unwrap();
+    let segs = crate::speakers::load_segments(&tx, &audio);
+    assert_eq!(segs.len(), 2, "NaN scores must not sink the parse");
+    assert_eq!(segs[0].speaker, "SPEAKER_01");
+    assert_eq!(segs[1].speaker, "SPEAKER_00", "word-majority speaker fallback");
+    assert_eq!(segs[1].text, "the value was NaN today", "text must be untouched");
+    let stats = crate::speakers::speaker_stats(&segs);
+    assert_eq!(stats.len(), 2);
+}

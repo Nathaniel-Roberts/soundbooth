@@ -469,8 +469,13 @@ impl App {
                     self.preview = transcript_preview(&out_dir, &self.file, 6);
                     self.segs = load_segments(&out_dir, &self.file);
                     self.stats = speaker_stats(&self.segs);
-                    if self.segs.is_empty() {
+                    if self.segs.is_empty() && self.preview.is_empty() {
                         self.notice = "transcription found no speech — check mic selection and gain (watch the level meter while talking)".into();
+                        self.enter_done();
+                    } else if self.segs.is_empty() {
+                        // transcript text exists but the json defeated us:
+                        // never claim silence when there are words on disk
+                        self.notice = "transcript ready, but its speaker data could not be parsed".into();
                         self.enter_done();
                     } else if self.stats.len() > 1 {
                         self.spk_cursor = 0;

@@ -15,21 +15,103 @@ pub struct WSeg {
     pub text: String,
     #[serde(default)]
     pub speaker: String,
+    #[serde(default)]
+    pub words: Vec<WWord>,
 }
 
-#[derive(Deserialize)]
-struct WDoc {
+#[derive(Deserialize, Clone, Default)]
+pub struct WWord {
     #[serde(default)]
-    segments: Vec<WSeg>,
+    pub speaker: String,
+}
+
+/// whispermlx emits bare NaN for some confidence scores, which is invalid
+/// JSON that serde (rightly) rejects. Replace bare NaN/Infinity tokens
+/// with 0, tracking string state so transcript text is never touched.
+fn sanitize_json(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_string {
+            out.push(c as char);
+            if escaped {
+                escaped = false;
+            } else if c == b'\\' {
+                escaped = true;
+            } else if c == b'"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'"' => {
+                in_string = true;
+                out.push('"');
+                i += 1;
+            }
+            b'N' if bytes[i..].starts_with(b"NaN") => {
+                out.push('0');
+                i += 3;
+            }
+            b'I' if bytes[i..].starts_with(b"Infinity") => {
+                out.push('0');
+                i += 8;
+            }
+            b'-' if bytes[i..].starts_with(b"-Infinity") => {
+                out.push('0');
+                i += 9;
+            }
+            _ => {
+                out.push(c as char);
+                i += 1;
+            }
+        }
+    }
+    out
 }
 
 pub fn load_segments(out_dir: &Path, audio: &Path) -> Vec<WSeg> {
     let path = out_dir.join(format!("{}.json", audio_stem(audio)));
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|s| serde_json::from_str::<WDoc>(&s).ok())
-        .map(|d| d.segments)
-        .unwrap_or_default()
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let data = if raw.contains("NaN") || raw.contains("Infinity") {
+        sanitize_json(&raw)
+    } else {
+        raw
+    };
+    let Ok(doc) = serde_json::from_str::<serde_json::Value>(&data) else {
+        return Vec::new();
+    };
+    let Some(arr) = doc.get("segments").and_then(|s| s.as_array()) else {
+        return Vec::new();
+    };
+    // per-segment parsing: one malformed segment must not sink the meeting
+    let mut out: Vec<WSeg> = arr
+        .iter()
+        .filter_map(|v| serde_json::from_value::<WSeg>(v.clone()).ok())
+        .collect();
+    // segment-level speaker can be absent: fall back to the majority
+    // speaker of the segment's words
+    for seg in &mut out {
+        if seg.speaker.is_empty() && !seg.words.is_empty() {
+            let mut counts: std::collections::HashMap<&str, usize> = Default::default();
+            for w in &seg.words {
+                if !w.speaker.is_empty() {
+                    *counts.entry(w.speaker.as_str()).or_insert(0) += 1;
+                }
+            }
+            if let Some((sp, _)) = counts.into_iter().max_by_key(|(_, n)| *n) {
+                seg.speaker = sp.to_string();
+            }
+        }
+    }
+    out
 }
 
 /// One diarised speaker, ranked by talk time.
