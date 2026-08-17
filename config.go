@@ -18,6 +18,10 @@ type Config struct {
 	Speakers   int    `json:"speakers"` // 0 = auto
 	Language   string `json:"language"`
 
+	// RetentionDays > 0 auto-deletes soundbooth recordings older than N
+	// days on startup; transcripts and markers are kept. 0 = keep forever.
+	RetentionDays int `json:"retention_days"`
+
 	Theme       string            `json:"theme"`
 	ThemeColors map[string]string `json:"theme_colors,omitempty"` // per-colour overrides
 	// PostCommand runs via `sh -c` after a successful transcription with
@@ -80,6 +84,9 @@ func loadConfig() Config {
 	}
 	if cfg.Theme == "" {
 		cfg.Theme = "mocha"
+	}
+	if cfg.RetentionDays < 0 || cfg.RetentionDays > 3650 {
+		cfg.RetentionDays = 0
 	}
 	return cfg
 }

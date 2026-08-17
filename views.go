@@ -33,6 +33,13 @@ func (m model) View() string {
 
 // --- setup ---
 
+func retentionLabel(days int) string {
+	if days == 0 {
+		return "keep audio forever"
+	}
+	return fmt.Sprintf("delete audio after %d days (transcripts kept)", days)
+}
+
 func bufferLabel(minutes int) string {
 	if minutes == 0 {
 		return "off — record from trigger (armed mode)"
@@ -71,6 +78,7 @@ func (m model) viewSetup() string {
 		{"Speakers", speakers},
 		{"Language", m.cfg.Language},
 		{"Theme", m.cfg.Theme},
+		{"Retention", retentionLabel(m.cfg.RetentionDays)},
 		{"", startLabel},
 	}
 	var b strings.Builder
@@ -96,6 +104,9 @@ func (m model) viewSetup() string {
 		out = lipgloss.JoinVertical(lipgloss.Left, out, themePreview(m.width))
 	}
 	var notes []string
+	if m.setupNote != "" {
+		notes = append(notes, dimStyle.Render(m.setupNote))
+	}
 	if len(m.orphans) > 0 {
 		o := m.orphans[0]
 		notes = append(notes, warnStyle.Render(fmt.Sprintf(
@@ -399,6 +410,43 @@ func (m model) viewSpeakers() string {
 
 func (m model) viewLibrary() string {
 	head := valueStyle.Render("library") + dimStyle.Render("  "+m.cfg.OutDir)
+
+	if m.libSearching {
+		return lipgloss.JoinVertical(lipgloss.Left, head, "",
+			panelStyle.Render(m.searchInput.View()), "",
+			keyHint("enter", "search", "esc", "cancel"))
+	}
+	if m.showHits {
+		var b strings.Builder
+		if len(m.hits) == 0 {
+			b.WriteString(dimStyle.Render("no matches for “" + m.searchInput.Value() + "”"))
+		}
+		maxRows := m.height - 10
+		if maxRows < 5 {
+			maxRows = 5
+		}
+		start := 0
+		if m.hitCursor >= maxRows {
+			start = m.hitCursor - maxRows + 1
+		}
+		for i := start; i < len(m.hits) && i < start+maxRows; i++ {
+			h := m.hits[i]
+			cursor := "  "
+			style := valueStyle
+			if i == m.hitCursor {
+				cursor = focusStyle.Render("> ")
+				style = focusStyle
+			}
+			fmt.Fprintf(&b, "%s%s  %s\n", cursor,
+				style.Render(fmt.Sprintf("%-40s", filepath.Base(h.Audio))),
+				dimStyle.Render(h.Snippet))
+		}
+		return lipgloss.JoinVertical(lipgloss.Left,
+			head+dimStyle.Render(fmt.Sprintf("  ·  %d hit(s) for “%s”", len(m.hits), m.searchInput.Value())), "",
+			panelStyle.Render(strings.TrimRight(b.String(), "\n")), "",
+			keyHint("enter", "open", "/", "new search", "esc", "back"))
+	}
+
 	if len(m.lib) == 0 {
 		return lipgloss.JoinVertical(lipgloss.Left, head, "",
 			panelStyle.Render(dimStyle.Render("no recordings yet")), "",
@@ -435,7 +483,7 @@ func (m model) viewLibrary() string {
 		confirm = errStyle.Render(fmt.Sprintf("delete %s and its transcript? y / any other key cancels",
 			filepath.Base(m.lib[m.libCursor].Path)))
 	}
-	hints := keyHint("enter", "open", "d", "delete", "o", "folder", "esc", "back")
+	hints := keyHint("enter", "open", "/", "search", "d", "delete", "o", "folder", "esc", "back")
 	parts := []string{head, "", panelStyle.Render(strings.TrimRight(b.String(), "\n"))}
 	if confirm != "" {
 		parts = append(parts, confirm)

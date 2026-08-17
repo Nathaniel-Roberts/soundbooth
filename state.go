@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -107,6 +108,34 @@ func sweepStaleSpools() {
 			_ = os.RemoveAll(m)
 		}
 	}
+}
+
+// recNameRe matches soundbooth's own recording filenames — retention must
+// never touch audio the user put in the folder themselves.
+var recNameRe = regexp.MustCompile(`-\d{8}-\d{6}\.flac$`)
+
+// sweepRetention deletes soundbooth recordings older than days. Transcript
+// directories and marker files are kept — only the audio goes.
+func sweepRetention(dir string, days int) int {
+	if days <= 0 {
+		return 0
+	}
+	cutoff := time.Now().AddDate(0, 0, -days)
+	matches, _ := filepath.Glob(filepath.Join(dir, "*.flac"))
+	n := 0
+	for _, p := range matches {
+		if !recNameRe.MatchString(p) {
+			continue
+		}
+		info, err := os.Stat(p)
+		if err != nil || info.ModTime().After(cutoff) {
+			continue
+		}
+		if os.Remove(p) == nil {
+			n++
+		}
+	}
+	return n
 }
 
 // freeBytes reports available disk space at path.

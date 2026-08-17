@@ -42,9 +42,12 @@ const (
 	fieldSpeakers
 	fieldLanguage
 	fieldTheme
+	fieldRetention
 	fieldStart
 	fieldCount
 )
+
+var retentionChoices = []int{0, 7, 30, 90, 180}
 
 var modelChoices = []string{"large-v3-turbo", "large-v3", "medium", "small", "base"}
 var languageChoices = []string{"en", "auto"}
@@ -102,6 +105,7 @@ type model struct {
 	outInput  textinput.Model
 	nameInput textinput.Model
 	setupErr  string
+	setupNote string
 	orphans   []orphan
 
 	// live capture (either mode)
@@ -155,6 +159,11 @@ type model struct {
 	libCursor    int
 	libConfirm   bool
 	fromLib      bool
+	libSearching bool // typing a query
+	searchInput  textinput.Model
+	hits         []searchHit
+	hitCursor    int
+	showHits     bool
 }
 
 func newModel() model {
@@ -184,20 +193,32 @@ func newModel() model {
 	spk.CharLimit = 48
 	spk.Prompt = ""
 
+	search := textinput.New()
+	search.CharLimit = 128
+	search.Prompt = "/ "
+	search.Placeholder = "search transcripts"
+
 	sp := spinner.New(spinner.WithSpinner(spinner.MiniDot))
 	sp.Style = lipgloss.NewStyle().Foreground(lipgloss.Color(th.Blue))
+
+	setupNote := ""
+	if n := sweepRetention(cfg.OutDir, cfg.RetentionDays); n > 0 {
+		setupNote = fmt.Sprintf("retention: deleted %d recording(s) older than %d days (transcripts kept)", n, cfg.RetentionDays)
+	}
 
 	return model{
 		cfg:       cfg,
 		scr:       screenSetup,
 		devices:   devices,
 		devIdx:    devIdx,
-		outInput:  out,
-		nameInput: name,
-		spkInput:  spk,
-		spin:      sp,
+		outInput:    out,
+		nameInput:   name,
+		spkInput:    spk,
+		searchInput: search,
+		spin:        sp,
 		rmaxdb:    -99,
 		orphans:   findOrphans(),
+		setupNote: setupNote,
 	}
 }
 
@@ -624,6 +645,14 @@ func (m *model) adjustField(dir int) {
 		applyTheme(applyOverrides(themeByName(m.cfg.Theme), m.cfg.ThemeColors))
 		m.spin.Style = lipgloss.NewStyle().Foreground(lipgloss.Color(th.Blue))
 		_ = m.cfg.save()
+	case fieldRetention:
+		i := 0
+		for j, r := range retentionChoices {
+			if r == m.cfg.RetentionDays {
+				i = j
+			}
+		}
+		m.cfg.RetentionDays = retentionChoices[(i+dir+len(retentionChoices))%len(retentionChoices)]
 	}
 }
 
@@ -956,7 +985,91 @@ func loadLibrary(dir string) []libEntry {
 	return out
 }
 
+// openLibEntry populates the done screen for a library recording.
+func (m *model) openLibEntry(e libEntry) {
+	m.file = e.Path
+	m.didTrans = e.HasTx
+	m.transErr = nil
+	m.transcriptMD = ""
+	m.markers = nil
+	m.markersFile = ""
+	m.postRan = true // never auto-run hooks on old recordings
+	m.postStatus = ""
+	m.notice = ""
+	m.fromLib = true
+	if e.HasTx {
+		m.txDir = strings.TrimSuffix(e.Path, filepath.Ext(e.Path))
+		m.preview = transcriptPreview(m.txDir, e.Path, 6)
+		m.segs = loadSegments(m.txDir, e.Path)
+		m.stats = speakerStats(m.segs)
+		md := filepath.Join(m.txDir, audioStem(e.Path)+"-transcript.md")
+		if _, err := os.Stat(md); err == nil {
+			m.transcriptMD = md
+		}
+	} else {
+		m.txDir = ""
+		m.preview = nil
+		m.segs = nil
+		m.stats = nil
+	}
+	m.scr = screenDone
+}
+
 func (m model) updateLibraryKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// typing a search query
+	if m.libSearching {
+		switch msg.String() {
+		case "esc":
+			m.libSearching = false
+			m.searchInput.Blur()
+			return m, nil
+		case "enter":
+			m.libSearching = false
+			m.searchInput.Blur()
+			m.hits = searchTranscripts(m.lib, m.searchInput.Value())
+			m.hitCursor = 0
+			m.showHits = true
+			return m, nil
+		}
+		var cmd tea.Cmd
+		m.searchInput, cmd = m.searchInput.Update(msg)
+		return m, cmd
+	}
+	// navigating search results
+	if m.showHits {
+		switch msg.String() {
+		case "esc", "q":
+			m.showHits = false
+		case "up", "k":
+			if m.hitCursor > 0 {
+				m.hitCursor--
+			}
+		case "down", "j":
+			if m.hitCursor < len(m.hits)-1 {
+				m.hitCursor++
+			}
+		case "/":
+			m.libSearching = true
+			m.searchInput.Focus()
+			return m, textinput.Blink
+		case "enter":
+			if len(m.hits) == 0 {
+				return m, nil
+			}
+			h := m.hits[m.hitCursor]
+			for _, e := range m.lib {
+				if e.Path == h.Audio {
+					m.openLibEntry(e)
+					// preview centres on the hit rather than the top
+					if ctx := hitContext(h, 2); len(ctx) > 0 {
+						m.preview = ctx
+					}
+					break
+				}
+			}
+		}
+		return m, nil
+	}
 	if m.libConfirm {
 		switch msg.String() {
 		case "y":
@@ -977,6 +1090,11 @@ func (m model) updateLibraryKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "esc", "q", "b":
 		m.scr = screenSetup
+	case "/":
+		m.libSearching = true
+		m.searchInput.SetValue("")
+		m.searchInput.Focus()
+		return m, textinput.Blink
 	case "up", "k":
 		if m.libCursor > 0 {
 			m.libCursor--
@@ -992,36 +1110,9 @@ func (m model) updateLibraryKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "o":
 		_ = exec.Command("open", m.cfg.OutDir).Start()
 	case "enter":
-		if len(m.lib) == 0 {
-			return m, nil
+		if len(m.lib) > 0 {
+			m.openLibEntry(m.lib[m.libCursor])
 		}
-		e := m.lib[m.libCursor]
-		m.file = e.Path
-		m.didTrans = e.HasTx
-		m.transErr = nil
-		m.transcriptMD = ""
-		m.markers = nil
-		m.markersFile = ""
-		m.postRan = true // never auto-run hooks on old recordings
-		m.postStatus = ""
-		m.notice = ""
-		m.fromLib = true
-		if e.HasTx {
-			m.txDir = strings.TrimSuffix(e.Path, filepath.Ext(e.Path))
-			m.preview = transcriptPreview(m.txDir, e.Path, 6)
-			m.segs = loadSegments(m.txDir, e.Path)
-			m.stats = speakerStats(m.segs)
-			md := filepath.Join(m.txDir, audioStem(e.Path)+"-transcript.md")
-			if _, err := os.Stat(md); err == nil {
-				m.transcriptMD = md
-			}
-		} else {
-			m.txDir = ""
-			m.preview = nil
-			m.segs = nil
-			m.stats = nil
-		}
-		m.scr = screenDone
 	}
 	return m, nil
 }
