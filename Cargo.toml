@@ -1,0 +1,21 @@
+[package]
+name = "soundbooth"
+version = "0.4.0"
+edition = "2021"
+license = "MIT"
+description = "Terminal meeting recorder with replay buffer and on-device transcription"
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.28"
+cpal = "0.15"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "5"
+chrono = "0.4"
+crossbeam-channel = "0.5"
+libc = "0.2"
+
+[profile.release]
+lto = true
+strip = true
