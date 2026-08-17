@@ -34,7 +34,10 @@
           '';
           # tests exercise the microphone; not possible in the nix sandbox
           doCheck = false;
-          meta.description = "Terminal meeting recorder with replay buffer and on-device transcription";
+          meta = {
+            description = "Terminal meeting recorder with replay buffer and on-device transcription";
+            license = pkgs.lib.licenses.mit;
+          };
         };
         default = soundbooth;
       });

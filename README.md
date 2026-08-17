@@ -114,3 +114,7 @@ to its own loader).
 go test ./...                          # render + mapping tests
 SOUNDBOOTH_HW_TEST=1 go test -v ./...  # plus a real 3 s microphone capture
 ```
+
+## Licence
+
+MIT — see [LICENSE](LICENSE).
