@@ -1211,15 +1211,13 @@ impl App {
                     self.lib_searching = true;
                     self.search_input.value.clear();
                 }
-                KeyCode::Enter => {
-                    if !self.hits.is_empty() {
-                        let h = self.hits[self.hit_cursor].clone();
-                        if let Some(e) = self.lib.iter().find(|e| e.path == h.audio).cloned() {
-                            self.open_lib_entry(&e);
-                            let ctx = hit_context(&h, 2);
-                            if !ctx.is_empty() {
-                                self.preview = ctx;
-                            }
+                KeyCode::Enter if !self.hits.is_empty() => {
+                    let h = self.hits[self.hit_cursor].clone();
+                    if let Some(e) = self.lib.iter().find(|e| e.path == h.audio).cloned() {
+                        self.open_lib_entry(&e);
+                        let ctx = hit_context(&h, 2);
+                        if !ctx.is_empty() {
+                            self.preview = ctx;
                         }
                     }
                 }

@@ -99,10 +99,8 @@ pub fn start_captioner() -> Result<Captioner, String> {
     let dir2 = tmp_dir.clone();
     std::thread::spawn(move || {
         let reader = BufReader::new(daemon_out);
-        let mut served = 0usize;
-        for line in reader.lines().map_while(Result::ok) {
+        for (served, line) in reader.lines().map_while(Result::ok).enumerate() {
             let _ = std::fs::remove_file(dir2.join(format!("chunk-{served}.wav")));
-            served += 1;
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
                 if let Some(text) = v.get("text").and_then(|t| t.as_str()) {
                     if !text.is_empty() {

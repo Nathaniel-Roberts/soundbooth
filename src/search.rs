@@ -33,7 +33,7 @@ pub fn load_library(dir: &str) -> Vec<LibEntry> {
             })
         })
         .collect();
-    out.sort_by(|a, b| b.modified.cmp(&a.modified));
+    out.sort_by_key(|e| std::cmp::Reverse(e.modified));
     out.truncate(200);
     out
 }

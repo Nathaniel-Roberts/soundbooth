@@ -55,6 +55,9 @@ fn pool(group: &[WaveCol]) -> WaveCol {
 /// Catppuccin gradient (lavender core to sapphire tips, RMS brightened),
 /// red for clipped columns, grey for paused spans and the idle hairline.
 /// `playhead` highlights one cell column (the player cursor).
+// index loops mirror the Braille bit table layout; iterator chains here
+// would obscure the dot maths
+#[allow(clippy::needless_range_loop)]
 pub fn render_wave(
     buf: &mut Buffer,
     area: Rect,

@@ -77,13 +77,10 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> std
     loop {
         let timeout = next.saturating_duration_since(Instant::now());
         if event::poll(timeout)? {
-            match event::read()? {
-                Event::Key(k) if k.kind == KeyEventKind::Press => {
-                    if app.on_key(k) {
-                        return Ok(());
-                    }
+            if let Event::Key(k) = event::read()? {
+                if k.kind == KeyEventKind::Press && app.on_key(k) {
+                    return Ok(());
                 }
-                _ => {}
             }
         }
         let now = Instant::now();
