@@ -7,9 +7,18 @@ import (
 	"path/filepath"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/termenv"
 )
 
 func main() {
+	// Force truecolor: lipgloss's auto-detection quantises hex colours to
+	// ANSI-256 when COLORTERM is unset (tmux, some terminals), which
+	// collapses the Catppuccin flavours into identical output. Every
+	// modern macOS terminal supports truecolor.
+	if os.Getenv("NO_COLOR") == "" {
+		lipgloss.SetColorProfile(termenv.TrueColor)
+	}
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
 		case "trigger", "stop", "marker":

@@ -140,6 +140,14 @@ func themePreview(width int) string {
 	for _, hex := range []string{th.Lavender, th.Blue, th.Sapphire, th.Green, th.Yellow, th.Red, th.Mauve, th.Text, th.Overlay0} {
 		sw.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color(hex)).Render("● "))
 	}
+	// background chips — the dark flavours differ most in their base tints
+	sw.WriteString("  ")
+	sw.WriteString(lipgloss.NewStyle().
+		Background(lipgloss.Color(th.Base)).Foreground(lipgloss.Color(th.Text)).
+		Render(" " + th.Name + " "))
+	sw.WriteString(lipgloss.NewStyle().
+		Background(lipgloss.Color(th.Surface0)).Foreground(lipgloss.Color(th.Subtext0)).
+		Render(" " + th.Base + " "))
 	body := wave + "\n" + renderVU(wCells-9, 0.62, 0.8) + "\n" + sw.String()
 	return panelStyle.Render(body)
 }
