@@ -60,7 +60,7 @@ type recErrMsg struct{ err error }
 type transLineMsg string
 type transLinesClosedMsg struct{}
 type transDoneMsg struct{ err error }
-type playDoneMsg struct{}
+type playDoneMsg struct{ gen int }
 
 // transcription pipeline stages, parsed from whispermlx output
 var stageNames = []string{"load model", "voice activity", "transcribe", "align", "diarise"}
@@ -153,6 +153,13 @@ type model struct {
 	markersFile  string
 	playCmd      *exec.Cmd
 	playing      bool
+	playGen      int
+	playStart    time.Time
+	pWave        []waveCol
+	pDur         float64
+	pPos         float64
+	pReady       bool
+	pDecoding    bool
 	postStatus   string
 	postRan      bool
 	lib          []libEntry
@@ -265,11 +272,86 @@ func waitTransDone(ch chan error) tea.Cmd {
 	return func() tea.Msg { return transDoneMsg{<-ch} }
 }
 
-func waitPlay(cmd *exec.Cmd) tea.Cmd {
+func waitPlay(cmd *exec.Cmd, gen int) tea.Cmd {
 	return func() tea.Msg {
 		_ = cmd.Wait()
-		return playDoneMsg{}
+		return playDoneMsg{gen: gen}
 	}
+}
+
+// --- player helpers ---
+
+func (m *model) resetPlayer() {
+	m.stopPlayback()
+	m.pWave = nil
+	m.pDur = 0
+	m.pPos = 0
+	m.pReady = false
+	m.pDecoding = false
+}
+
+// ensureDecode kicks the whole-file waveform decode for the player.
+func (m *model) ensureDecode() tea.Cmd {
+	if m.pReady || m.pDecoding || m.file == "" {
+		return nil
+	}
+	if _, err := os.Stat(m.file); err != nil {
+		return nil
+	}
+	w := m.width - 6
+	if w < 20 {
+		w = 60
+	}
+	m.pDecoding = true
+	return decodeWave(m.file, w*2)
+}
+
+// curPos is the current playback position in seconds.
+func (m *model) curPos() float64 {
+	pos := m.pPos
+	if m.playing {
+		pos += time.Since(m.playStart).Seconds()
+	}
+	if m.pDur > 0 && pos > m.pDur {
+		pos = m.pDur
+	}
+	if pos < 0 {
+		pos = 0
+	}
+	return pos
+}
+
+// seekTo moves the playhead, restarting audio if currently playing.
+func (m *model) seekTo(t float64) tea.Cmd {
+	if t < 0 {
+		t = 0
+	}
+	if m.pDur > 0 && t > m.pDur-0.2 {
+		t = m.pDur - 0.2
+		if t < 0 {
+			t = 0
+		}
+	}
+	wasPlaying := m.playing
+	m.stopPlayback()
+	m.pPos = t
+	if !wasPlaying {
+		return nil
+	}
+	return m.beginPlayback()
+}
+
+func (m *model) beginPlayback() tea.Cmd {
+	cmd, err := startPlayback(m.file, m.pPos)
+	if err != nil {
+		m.notice = err.Error()
+		return nil
+	}
+	m.playCmd = cmd
+	m.playing = true
+	m.playGen++
+	m.playStart = time.Now()
+	return tea.Batch(waitPlay(cmd, m.playGen), playTick())
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -379,7 +461,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.notice = "recording stopped: " + err.Error()
 		m.finishFiles()
 		m.scr = screenDone
-		return m, nil
+		m.resetPlayer()
+		return m, m.ensureDecode()
 
 	case transLineMsg:
 		line := string(msg)
@@ -411,7 +494,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.didTrans = msg.err == nil
 		if !m.didTrans {
 			m.scr = screenDone
-			return m, nil
+			m.resetPlayer()
+			return m, m.ensureDecode()
 		}
 		m.txDir = m.trans.OutDir
 		m.preview = transcriptPreview(m.txDir, m.file, 6)
@@ -420,7 +504,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if len(m.segs) == 0 {
 			m.notice = "transcription found no speech — check mic selection and gain (watch the level meter while talking)"
 			m.scr = screenDone
-			return m, nil
+			m.resetPlayer()
+			return m, m.ensureDecode()
 		}
 		if len(m.stats) > 1 {
 			m.spkCursor = 0
@@ -439,8 +524,32 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case playDoneMsg:
-		m.playing = false
+		if msg.gen != m.playGen {
+			return m, nil // stale watcher from a killed playback
+		}
+		if m.playing {
+			m.pPos += time.Since(m.playStart).Seconds()
+			if m.pDur > 0 && m.pPos >= m.pDur-0.5 {
+				m.pPos = 0 // natural end: rewind
+			}
+			m.playing = false
+		}
 		m.playCmd = nil
+		return m, nil
+
+	case waveReadyMsg:
+		m.pDecoding = false
+		if msg.err == nil && msg.file == m.file {
+			m.pWave = msg.cols
+			m.pDur = msg.dur
+			m.pReady = true
+		}
+		return m, nil
+
+	case playTickMsg:
+		if m.playing && m.scr == screenDone {
+			return m, playTick()
+		}
 		return m, nil
 
 	case spinner.TickMsg:
@@ -595,7 +704,8 @@ func (m model) recoverOrphan(o orphan) (tea.Model, tea.Cmd) {
 	m.notice = "recovered from unfinished session"
 	m.markers = nil
 	m.scr = screenDone
-	return m, nil
+	m.resetPlayer()
+	return m, m.ensureDecode()
 }
 
 func (m *model) adjustField(dir int) {
@@ -843,7 +953,8 @@ func (m model) updateRecordingKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		m.finishFiles()
 		m.scr = screenDone
-		return m, nil
+		m.resetPlayer()
+		return m, m.ensureDecode()
 	}
 	return m, nil
 }
@@ -954,12 +1065,14 @@ func (m model) enterDone() (tea.Model, tea.Cmd) {
 		}
 	}
 	m.scr = screenDone
+	m.resetPlayer()
 	if m.didTrans && !m.postRan && m.cfg.PostCommand != "" {
 		m.postRan = true
 		m.postStatus = "post-hook: running..."
-		return m, runPostHook(m.cfg.PostCommand, m.file, m.txDir, m.transcriptMD, m.markersFile)
+		return m, tea.Batch(m.ensureDecode(),
+			runPostHook(m.cfg.PostCommand, m.file, m.txDir, m.transcriptMD, m.markersFile))
 	}
-	return m, nil
+	return m, m.ensureDecode()
 }
 
 // --- library ---
@@ -997,6 +1110,8 @@ func (m *model) openLibEntry(e libEntry) {
 	m.postStatus = ""
 	m.notice = ""
 	m.fromLib = true
+	m.resetPlayer()
+	m.markers = loadMarkersFromFile(e.Path)
 	if e.HasTx {
 		m.txDir = strings.TrimSuffix(e.Path, filepath.Ext(e.Path))
 		m.preview = transcriptPreview(m.txDir, e.Path, 6)
@@ -1064,7 +1179,7 @@ func (m model) updateLibraryKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					if ctx := hitContext(h, 2); len(ctx) > 0 {
 						m.preview = ctx
 					}
-					break
+					return m, m.ensureDecode()
 				}
 			}
 		}
@@ -1112,6 +1227,7 @@ func (m model) updateLibraryKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "enter":
 		if len(m.lib) > 0 {
 			m.openLibEntry(m.lib[m.libCursor])
+			return m, m.ensureDecode()
 		}
 	}
 	return m, nil
@@ -1135,17 +1251,34 @@ func (m model) updateDoneKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 	case "o":
 		_ = exec.Command("open", filepath.Dir(m.file)).Start()
-	case "p":
+	case "p", " ":
 		if m.playing {
 			m.stopPlayback()
 			return m, nil
 		}
-		cmd := exec.Command("afplay", m.file)
-		if err := cmd.Start(); err == nil {
-			m.playCmd = cmd
-			m.playing = true
-			return m, waitPlay(cmd)
+		return m, tea.Batch(m.beginPlayback(), m.ensureDecode())
+	case "left", "h":
+		return m, m.seekTo(m.curPos() - 5)
+	case "right", "l":
+		return m, m.seekTo(m.curPos() + 5)
+	case "[":
+		cur := m.curPos()
+		target := 0.0
+		for _, mk := range m.markers {
+			s := mk.Seconds()
+			if s < cur-1 && s > target {
+				target = s
+			}
 		}
+		return m, m.seekTo(target)
+	case "]":
+		cur := m.curPos()
+		for _, mk := range m.markers {
+			if s := mk.Seconds(); s > cur+0.5 {
+				return m, m.seekTo(s)
+			}
+		}
+		return m, nil
 	case "t":
 		if m.file != "" {
 			if _, err := os.Stat(m.file); err == nil {
@@ -1169,10 +1302,17 @@ func (m model) updateDoneKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m *model) stopPlayback() {
+	if m.playing {
+		m.pPos += time.Since(m.playStart).Seconds()
+		if m.pDur > 0 && m.pPos > m.pDur {
+			m.pPos = m.pDur
+		}
+	}
+	m.playing = false
+	m.playGen++ // orphan any pending waitPlay watcher
 	if m.playCmd != nil && m.playCmd.Process != nil {
 		_ = m.playCmd.Process.Kill()
 	}
-	m.playing = false
 	m.playCmd = nil
 }
 

@@ -501,6 +501,33 @@ func (m model) viewDone() string {
 		lines = append(lines, warnStyle.Render(m.notice))
 	}
 
+	// seekable player
+	if m.pReady && len(m.pWave) > 0 && m.pDur > 0 {
+		wCells := len(m.pWave) / 2
+		if avail := m.width - 6; avail >= 20 && avail < wCells {
+			wCells = avail
+		}
+		cur := m.curPos()
+		head := int(cur / m.pDur * float64(wCells))
+		if head >= wCells {
+			head = wCells - 1
+		}
+		lines = append(lines, "")
+		lines = append(lines, renderWaveHead(m.pWave, wCells, 7, head))
+		state := "⏸"
+		if m.playing {
+			state = "▶"
+		}
+		transport := fmt.Sprintf("%s %s / %s", state,
+			fmtClock(cur), fmtClock(m.pDur))
+		if len(m.markers) > 0 {
+			transport += fmt.Sprintf("  ·  %d marker(s), [ ] to jump", len(m.markers))
+		}
+		lines = append(lines, dimStyle.Render(transport))
+	} else if m.pDecoding {
+		lines = append(lines, dimStyle.Render("decoding waveform…"))
+	}
+
 	// session stats from the diarised segments
 	if m.didTrans && len(m.segs) > 0 {
 		var dur, words float64
@@ -560,9 +587,9 @@ func (m model) viewDone() string {
 
 	playHint := "play"
 	if m.playing {
-		playHint = "stop playback"
+		playHint = "pause"
 	}
-	hintPairs := []string{"p", playHint, "n", "new recording", "o", "open folder"}
+	hintPairs := []string{"p", playHint, "←→", "±5s", "n", "new recording", "o", "open folder"}
 	if m.didTrans && len(m.stats) > 0 {
 		hintPairs = append([]string{"s", "speakers"}, hintPairs...)
 	}

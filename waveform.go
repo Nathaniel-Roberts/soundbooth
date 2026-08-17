@@ -83,12 +83,18 @@ func renderWaveStereo(cols []waveCol, wCells, hCells int) string {
 	return top + "\n" + bottom
 }
 
-// renderWave draws the last cols of audio as an Audacity-style waveform:
-// mirrored around a centre line, Braille dots for 2x4 sub-cell resolution,
-// a vertical Catppuccin gradient (lavender core to sapphire tips, RMS
-// cells brightened), red for clipped columns, grey for paused spans and
-// the idle hairline.
+// renderWave draws with no playhead (live view, previews).
 func renderWave(cols []waveCol, wCells, hCells int) string {
+	return renderWaveHead(cols, wCells, hCells, -1)
+}
+
+// renderWaveHead draws the last cols of audio as an Audacity-style
+// waveform: mirrored around a centre line, Braille dots for 2x4 sub-cell
+// resolution, a vertical Catppuccin gradient (lavender core to sapphire
+// tips, RMS cells brightened), red for clipped columns, grey for paused
+// spans and the idle hairline. playhead >= 0 highlights that cell column
+// (the seekable player's cursor).
+func renderWaveHead(cols []waveCol, wCells, hCells int, playhead int) string {
 	if wCells < 1 || hCells < 1 {
 		return ""
 	}
@@ -206,6 +212,12 @@ func renderWave(cols []waveCol, wCells, hCells int) string {
 						}
 					}
 				}
+			}
+			if cx == playhead {
+				// player cursor: a bright full-height dot column
+				c := rune(0x2800 + (bits | 0x01 | 0x02 | 0x04 | 0x40))
+				emit(th.Text, c)
+				continue
 			}
 			if bits == 0 {
 				emit(lastHex, ' ')
