@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -83,12 +84,39 @@ type model struct {
 
 
 	// transcription
-	trans    *Transcriber
-	spin     spinner.Model
-	transLog []string
-	transErr error
-	didTrans bool
-	preview  []string
+	trans      *Transcriber
+	spin       spinner.Model
+	transLog   []string
+	transErr   error
+	didTrans   bool
+	preview    []string
+	showLog    bool
+	transStart time.Time
+	stage      int
+	stagePct   float64  // transcription stage progress 0..1
+	liveSegs   []string // transcript segments streaming in
+}
+
+// transcription pipeline stages, parsed from whispermlx output
+var stageNames = []string{"load model", "voice activity", "transcribe", "align", "diarise"}
+
+var segLineRe = regexp.MustCompile(`^\[\s*\d+(\.\d+)?\s*-->\s*\d+(\.\d+)?\]\s*(.+)$`)
+var pctRe = regexp.MustCompile(`Transcribing:\s*(\d+)%`)
+
+func stageOf(line string) int {
+	switch {
+	case strings.Contains(line, "Performing diarization") || strings.Contains(line, "Loading diarization model"):
+		return 4
+	case strings.Contains(line, "Performing alignment"):
+		return 3
+	case strings.Contains(line, "Performing transcription") || strings.Contains(line, "Transcribing:"):
+		return 2
+	case strings.Contains(line, "voice activity detection"):
+		return 1
+	case strings.Contains(line, "Loading MLX Whisper model"):
+		return 0
+	}
+	return -1
 }
 
 func newModel() model {
@@ -185,6 +213,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.updateArmedKeys(msg)
 		case screenRecording:
 			return m.updateRecordingKeys(msg)
+		case screenTranscribing:
+			if msg.String() == "l" {
+				m.showLog = !m.showLog
+			}
+			return m, nil
 		case screenDone:
 			return m.updateDoneKeys(msg)
 		}
@@ -238,9 +271,24 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case transLineMsg:
-		m.transLog = append(m.transLog, string(msg))
+		line := string(msg)
+		m.transLog = append(m.transLog, line)
 		if len(m.transLog) > 400 {
 			m.transLog = m.transLog[len(m.transLog)-200:]
+		}
+		if s := stageOf(line); s > m.stage {
+			m.stage = s
+		}
+		if pm := pctRe.FindStringSubmatch(line); pm != nil {
+			if pct, err := strconv.Atoi(pm[1]); err == nil {
+				m.stagePct = float64(pct) / 100
+			}
+		}
+		if sm := segLineRe.FindStringSubmatch(line); sm != nil {
+			m.liveSegs = append(m.liveSegs, strings.TrimSpace(sm[3]))
+			if len(m.liveSegs) > 4 {
+				m.liveSegs = m.liveSegs[len(m.liveSegs)-4:]
+			}
 		}
 		return m, waitTransLine(m.trans.Lines)
 
@@ -574,6 +622,10 @@ func (m model) beginTranscribe() (tea.Model, tea.Cmd) {
 	}
 	m.trans = trans
 	m.transLog = nil
+	m.liveSegs = nil
+	m.stage = 0
+	m.stagePct = 0
+	m.transStart = time.Now()
 	m.scr = screenTranscribing
 	return m, tea.Batch(m.spin.Tick, waitTransLine(trans.Lines), waitTransDone(trans.Done))
 }
@@ -826,18 +878,76 @@ func transcribeSuffix(on bool) string {
 }
 
 func (m model) viewTranscribing() string {
-	tail := m.transLog
-	maxLines := m.height - 10
-	if maxLines < 4 {
-		maxLines = 4
+	head := fmt.Sprintf("%s %s  %s", m.spin.View(),
+		valueStyle.Render("transcribing "+filepath.Base(m.file)),
+		dimStyle.Render(fmt.Sprintf("%s · %s · Apple GPU", m.cfg.Model, fmtDur(time.Since(m.transStart)))))
+
+	if m.showLog {
+		tail := m.transLog
+		maxLines := m.height - 10
+		if maxLines < 4 {
+			maxLines = 4
+		}
+		if len(tail) > maxLines {
+			tail = tail[len(tail)-maxLines:]
+		}
+		return lipgloss.JoinVertical(lipgloss.Left, head, "",
+			panelStyle.Render(dimStyle.Render(strings.Join(tail, "\n"))), "",
+			keyHint("l", "hide log", "ctrl+c", "abort"))
 	}
-	if len(tail) > maxLines {
-		tail = tail[len(tail)-maxLines:]
+
+	var b strings.Builder
+	for i, name := range stageNames {
+		switch {
+		case i < m.stage:
+			b.WriteString(okStyle.Render("  ✓ ") + dimStyle.Render(name))
+		case i == m.stage:
+			b.WriteString("  " + m.spin.View() + " " + focusStyle.Render(name))
+			if i == 2 && m.stagePct > 0 {
+				b.WriteString("  " + renderProgress(24, m.stagePct) +
+					dimStyle.Render(fmt.Sprintf(" %3.0f%%", m.stagePct*100)))
+			}
+		default:
+			b.WriteString(dimStyle.Render("  · " + name))
+		}
+		b.WriteByte('\n')
 	}
-	log := dimStyle.Render(strings.Join(tail, "\n"))
-	head := fmt.Sprintf("%s %s", m.spin.View(),
-		valueStyle.Render("transcribing "+filepath.Base(m.file)+" ("+m.cfg.Model+", Apple GPU)"))
-	return lipgloss.JoinVertical(lipgloss.Left, head, "", panelStyle.Render(log))
+	body := strings.TrimRight(b.String(), "\n")
+
+	if len(m.liveSegs) > 0 {
+		body += "\n\n" + labelStyle.Render("  hearing:")
+		for _, s := range m.liveSegs {
+			if len(s) > 90 {
+				s = s[:90] + "…"
+			}
+			body += "\n" + dimStyle.Render("    "+s)
+		}
+	}
+	return lipgloss.JoinVertical(lipgloss.Left, head, "",
+		panelStyle.Render(body), "",
+		keyHint("l", "show log", "ctrl+c", "abort"))
+}
+
+// renderProgress draws a gradient progress bar, frac 0..1.
+func renderProgress(width int, frac float64) string {
+	if frac < 0 {
+		frac = 0
+	}
+	if frac > 1 {
+		frac = 1
+	}
+	fill := int(frac*float64(width) + 0.5)
+	var b strings.Builder
+	for i := 0; i < width; i++ {
+		if i < fill {
+			t := float64(i) / float64(width-1)
+			b.WriteString(lipgloss.NewStyle().
+				Foreground(lipgloss.Color(waveRamp(t))).Render("█"))
+		} else {
+			b.WriteString(lipgloss.NewStyle().Foreground(mochaSurface0).Render("░"))
+		}
+	}
+	return b.String()
 }
 
 func (m model) viewDone() string {

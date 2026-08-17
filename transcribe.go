@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"os"
 	"os/exec"
@@ -75,6 +76,20 @@ func startTranscribe(file, model, language string, speakers int) (*Transcriber, 
 	go func() {
 		scanner := bufio.NewScanner(stdout)
 		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+		// Split on \r as well as \n: tqdm progress bars redraw with bare
+		// carriage returns, and the UI wants those percentages live.
+		scanner.Split(func(data []byte, atEOF bool) (int, []byte, error) {
+			if atEOF && len(data) == 0 {
+				return 0, nil, nil
+			}
+			if i := bytes.IndexAny(data, "\r\n"); i >= 0 {
+				return i + 1, data[:i], nil
+			}
+			if atEOF {
+				return len(data), data, nil
+			}
+			return 0, nil, nil
+		})
 		for scanner.Scan() {
 			line := strings.TrimSpace(scanner.Text())
 			if line == "" {
