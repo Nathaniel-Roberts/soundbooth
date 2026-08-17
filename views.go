@@ -71,9 +71,11 @@ func (m model) viewSetup() string {
 		{"Save to", m.outInput.View()},
 		{"Name", m.nameInput.View()},
 		{"Channels", onOff(m.cfg.Channels == 2, "stereo", "mono")},
+		{"System audio", onOff(m.cfg.SystemAudio, "on — capture calls/apps too (record mode)", "off — mic only")},
 		{"Mode", mode},
 		{"Buffer", bufferLabel(m.cfg.BufferMin)},
 		{"Transcribe", onOff(m.cfg.Transcribe, "on", "off")},
+		{"Live captions", onOff(m.cfg.LiveCaptions, "on — rough captions while recording", "off")},
 		{"Whisper model", m.cfg.Model},
 		{"Speakers", speakers},
 		{"Language", m.cfg.Language},
@@ -194,7 +196,7 @@ func (m model) viewLive() string {
 	}
 
 	var wave string
-	if m.cfg.Channels == 2 {
+	if m.cfg.Channels == 2 || m.sysCap != nil {
 		wave = renderWaveStereo(cols, wCells, hCells)
 	} else {
 		wave = renderWave(cols, wCells, hCells)
@@ -249,9 +251,17 @@ func (m model) viewLive() string {
 		hints = keyHint("p", "resume", "enter", "stop"+transcribeSuffix(m.cfg.Transcribe), "x", "skip transcribe")
 	default:
 		badge = errStyle.Render("● REC")
-		detail = dimStyle.Render(fmt.Sprintf("%s  ·  %s  %s",
-			fmtDur(m.rec.Elapsed()), filepath.Base(m.file), humanSize(m.rec.FileSize())))
-		hints = keyHint("p", "pause", "m", markerHint, "+/-", "zoom", "enter", "stop"+transcribeSuffix(m.cfg.Transcribe), "x", "skip transcribe")
+		src := ""
+		if m.sysCap != nil {
+			src = "mic ▲ + system ▼  ·  "
+		}
+		detail = dimStyle.Render(fmt.Sprintf("%s%s  ·  %s  %s",
+			src, fmtDur(m.rec.Elapsed()), filepath.Base(m.file), humanSize(m.rec.FileSize())))
+		if m.sysCap != nil {
+			hints = keyHint("m", markerHint, "+/-", "zoom", "enter", "stop"+transcribeSuffix(m.cfg.Transcribe), "x", "skip transcribe")
+		} else {
+			hints = keyHint("p", "pause", "m", markerHint, "+/-", "zoom", "enter", "stop"+transcribeSuffix(m.cfg.Transcribe), "x", "skip transcribe")
+		}
 	}
 
 	hold := (m.rmaxdb - dbFloor) / -dbFloor
@@ -272,6 +282,26 @@ func (m model) viewLive() string {
 
 	status := badge + "  " + level + "  " + detail
 	parts := []string{panel.Render(wave), status, vu}
+	if m.captioner != nil {
+		if len(m.captions) == 0 {
+			parts = append(parts, dimStyle.Render("live: (captions warming up…)"))
+		} else {
+			show := m.captions
+			if len(show) > 2 {
+				show = show[len(show)-2:]
+			}
+			for i, cline := range show {
+				if len(cline) > m.width-12 && m.width > 20 {
+					cline = cline[:m.width-12] + "…"
+				}
+				label := "     "
+				if i == 0 {
+					label = "live:"
+				}
+				parts = append(parts, labelStyle.Render(label)+" "+dimStyle.Render(cline))
+			}
+		}
+	}
 	if m.diskFree >= 0 && m.diskFree < 2<<30 && m.scr == screenRecording {
 		hoursLeft := float64(m.diskFree) / (50 * 1024 * float64(m.cfg.Channels)) / 3600
 		parts = append(parts, warnStyle.Render(

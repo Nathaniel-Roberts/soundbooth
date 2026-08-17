@@ -73,6 +73,19 @@ cares about the recording, not the retention policy. Tell people.
    spans render grey; segments concatenate seamlessly), enter stops and
    transcribes, `x` stops and skips. If the input device dies mid-take,
    capture recovers onto the default mic and drops an automatic marker.
+
+   **System audio** (record mode): captures Teams/Zoom/any app audio
+   alongside the mic via a ScreenCaptureKit helper — no driver, no sudo,
+   just the Screen Recording permission for your terminal. The waveform
+   splits into mic (top) and system (bottom) lanes and the final file is
+   stereo with mic on the left channel, system on the right, which also
+   gives diarisation a clean you-vs-them split. Needs the Xcode command
+   line tools the first time (the helper compiles once and is cached).
+
+   **Live captions**: a small whisper model stays warm on the GPU and
+   captions the mic in rough 5-second chunks under the waveform. A few
+   seconds behind and silence-gated by design; the accurate diarised
+   transcript still comes from the full pass at stop.
 3. **Armed** — the replay buffer. Live waveform while buffering; enter
    saves the last N minutes and keeps recording; `x` disarms and
    discards. With buffer off it is a pure standby screen: metered, but
@@ -83,12 +96,24 @@ cares about the recording, not the retention policy. Tell people.
    longest quote; assign real names, which land in a merged
    `-transcript.md`.
 6. **Done** — stats (speech time, words, markers, clips), talk-time
-   bars, transcript preview. `p` plays the audio, `t` (re)transcribes,
+   bars, transcript preview, and a seekable player: the whole file
+   rendered as a waveform with a playhead, `p`/space play-pause, arrow
+   keys seek 5 s, `[` `]` jump between markers. `t` (re)transcribes,
    `n` new recording, `o` open folder. A configurable `post_command`
    runs here with SB_AUDIO / SB_TRANSCRIPT_MD / SB_TRANSCRIPT_DIR /
    SB_MARKERS in the environment — point it at an LLM summariser, a
    copy step, whatever.
 7. **Library** — browse past recordings, open, delete, re-transcribe.
+   `/` greps every transcript (case-insensitive) and jumps straight to
+   the hit, with the done-screen preview centred on the matched lines.
+
+## Retention
+
+Set Retention on the setup screen (or `retention_days` in the config)
+and soundbooth deletes its own recordings older than N days on startup —
+transcripts and markers are kept. It only ever touches files matching
+its own timestamped naming pattern; anything else in the folder is left
+alone.
 
 ## Architecture
 

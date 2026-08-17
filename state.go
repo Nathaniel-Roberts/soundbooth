@@ -100,12 +100,22 @@ func findOrphans() []orphan {
 }
 
 // sweepStaleSpools removes leftover armed-mode spool dirs from previous
-// runs — the replay buffer must never survive a crash.
+// runs — the replay buffer must never survive a crash — plus stray
+// mic/system track parts older than a day.
 func sweepStaleSpools() {
 	matches, _ := filepath.Glob(filepath.Join(os.TempDir(), "soundbooth-spool-*"))
 	for _, m := range matches {
 		if strings.Contains(m, "soundbooth-spool-") {
 			_ = os.RemoveAll(m)
+		}
+	}
+	cutoff := time.Now().Add(-24 * time.Hour)
+	for _, pat := range []string{"mic-*.flac", "sys-*.flac"} {
+		parts, _ := filepath.Glob(filepath.Join(sessionsDir(), pat))
+		for _, p := range parts {
+			if info, err := os.Stat(p); err == nil && info.ModTime().Before(cutoff) {
+				_ = os.Remove(p)
+			}
 		}
 	}
 }

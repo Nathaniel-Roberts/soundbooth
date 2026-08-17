@@ -35,9 +35,11 @@ const (
 	fieldOutDir
 	fieldName
 	fieldChannels
+	fieldSysAudio
 	fieldMode
 	fieldBuffer
 	fieldTranscribe
+	fieldCaptions
 	fieldModel
 	fieldSpeakers
 	fieldLanguage
@@ -56,6 +58,11 @@ var zoomLevels = []int{1, 2, 5}                 // meter ticks per Braille sub-c
 
 type meterMsg MeterTick
 type meterClosedMsg struct{}
+type sysTickMsg MeterTick
+type sysTicksClosedMsg struct{}
+type sysReadyMsg struct{ err error }
+type captionMsg string
+type captionsClosedMsg struct{}
 type recErrMsg struct{ err error }
 type transLineMsg string
 type transLinesClosedMsg struct{}
@@ -112,6 +119,11 @@ type model struct {
 	rec       *Recorder // record-now mode
 	spool     *Spooler  // armed mode
 	meter     *Meter    // armed mode's meter (record mode uses rec.Meter)
+	sysCap    *SysCapture
+	sysLevel  MeterTick // latest system-audio meter tick
+	micFile   string    // temp mic track when system audio is being merged
+	captioner *Captioner
+	captions  []string // rolling live captions
 	armStart  time.Time
 	mark      time.Time // armed: when the save was triggered
 	file      string
@@ -258,6 +270,30 @@ func waitRecErr(ch chan error) tea.Cmd {
 	return func() tea.Msg { return recErrMsg{<-ch} }
 }
 
+func waitSysReady(s *SysCapture) tea.Cmd {
+	return func() tea.Msg { return sysReadyMsg{s.WaitReady(6 * time.Second)} }
+}
+
+func waitSysTick(ch chan MeterTick) tea.Cmd {
+	return func() tea.Msg {
+		t, ok := <-ch
+		if !ok {
+			return sysTicksClosedMsg{}
+		}
+		return sysTickMsg(t)
+	}
+}
+
+func waitCaption(ch chan string) tea.Cmd {
+	return func() tea.Msg {
+		line, ok := <-ch
+		if !ok {
+			return captionsClosedMsg{}
+		}
+		return captionMsg(line)
+	}
+}
+
 func waitTransLine(ch chan string) tea.Cmd {
 	return func() tea.Msg {
 		line, ok := <-ch
@@ -389,12 +425,52 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case remoteCmdMsg:
 		return m.handleRemote(msg.cmd)
 
+	case sysReadyMsg:
+		if msg.err != nil && m.sysCap != nil {
+			m.sysCap.Stop()
+			m.sysCap = nil
+			m.notice = "system audio unavailable: " + msg.err.Error() + " — recording mic only"
+		}
+		return m, nil
+
+	case sysTickMsg:
+		m.sysLevel = MeterTick(msg)
+		if m.sysCap != nil {
+			return m, waitSysTick(m.sysCap.Ticks)
+		}
+		return m, nil
+
+	case sysTicksClosedMsg:
+		return m, nil
+
+	case captionMsg:
+		m.captions = append(m.captions, string(msg))
+		if len(m.captions) > 3 {
+			m.captions = m.captions[len(m.captions)-3:]
+		}
+		if m.captioner != nil {
+			return m, waitCaption(m.captioner.Lines)
+		}
+		return m, nil
+
+	case captionsClosedMsg:
+		return m, nil
+
 	case meterMsg:
 		if m.scr != screenRecording && m.scr != screenArmed {
 			return m, nil
 		}
 		t := MeterTick(msg)
 		col := waveCol{rms: t.RMS, peak: t.Peak, rmsR: t.RMSR, peakR: t.PeakR, clip: t.Clip}
+		if m.sysCap != nil {
+			// stereo lanes become mic (top) and system audio (bottom)
+			col.rmsR = m.sysLevel.RMS
+			col.peakR = m.sysLevel.Peak
+			col.clip = col.clip || m.sysLevel.Clip
+			if m.sysLevel.DB > t.DB {
+				t.DB = m.sysLevel.DB
+			}
+		}
 		if m.rec != nil && m.rec.Paused() {
 			col.paused = true
 			col.clip = false
@@ -573,6 +649,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // teardown stops every live process. Recordings in flight are finalised;
 // an untriggered armed buffer is discarded (that is its contract).
 func (m *model) teardown() {
+	if m.captioner != nil {
+		m.captioner.Stop()
+		m.captioner = nil
+	}
+	if m.sysCap != nil {
+		m.sysCap.Stop()
+		m.sysCap = nil
+	}
 	if m.rec != nil {
 		_ = m.rec.Stop()
 	}
@@ -718,6 +802,8 @@ func (m *model) adjustField(dir int) {
 		} else {
 			m.cfg.Channels = 1
 		}
+	case fieldSysAudio:
+		m.cfg.SystemAudio = !m.cfg.SystemAudio
 	case fieldMode:
 		if m.cfg.Mode == "record" {
 			m.cfg.Mode = "armed"
@@ -734,6 +820,8 @@ func (m *model) adjustField(dir int) {
 		m.cfg.BufferMin = bufferChoices[(i+dir+len(bufferChoices))%len(bufferChoices)]
 	case fieldTranscribe:
 		m.cfg.Transcribe = !m.cfg.Transcribe
+	case fieldCaptions:
+		m.cfg.LiveCaptions = !m.cfg.LiveCaptions
 	case fieldModel:
 		i := indexOf(modelChoices, m.cfg.Model)
 		m.cfg.Model = modelChoices[(i+dir+len(modelChoices))%len(modelChoices)]
@@ -827,9 +915,22 @@ func (m model) start() (tea.Model, tea.Cmd) {
 }
 
 func (m model) startRecording() (tea.Model, tea.Cmd) {
-	m.file = filepath.Join(m.cfg.OutDir,
-		fmt.Sprintf("%s-%s.flac", m.name, time.Now().Format("20060102-150405")))
-	rec, err := NewRecorder(m.cfg.Device, m.file, m.cfg.Channels)
+	ts := time.Now().Format("20060102-150405")
+	m.file = filepath.Join(m.cfg.OutDir, fmt.Sprintf("%s-%s.flac", m.name, ts))
+
+	useSys := m.cfg.SystemAudio && m.cfg.Mode == "record"
+	micTarget := m.file
+	channels := m.cfg.Channels
+	if useSys {
+		// mic goes to a temp mono track, merged with the system track at
+		// stop (mic = left, system = right)
+		_ = os.MkdirAll(sessionsDir(), 0o755)
+		m.micFile = filepath.Join(sessionsDir(), "mic-"+ts+".flac")
+		micTarget = m.micFile
+		channels = 1
+	}
+
+	rec, err := NewRecorder(m.cfg.Device, micTarget, channels)
 	if err != nil {
 		m.setupErr = err.Error()
 		return m, nil
@@ -840,7 +941,31 @@ func (m model) startRecording() (tea.Model, tea.Cmd) {
 	}
 	m.rec = rec
 	m.scr = screenRecording
-	return m, tea.Batch(waitMeter(rec.Meter.Ticks), waitRecErr(rec.Err))
+
+	cmds := []tea.Cmd{waitMeter(rec.Meter.Ticks), waitRecErr(rec.Err)}
+	if m.cfg.LiveCaptions {
+		if cap, err := startCaptioner(m.cfg.Device); err != nil {
+			m.notice = "live captions unavailable: " + err.Error()
+		} else {
+			m.captioner = cap
+			m.captions = nil
+			cmds = append(cmds, waitCaption(cap.Lines))
+		}
+	}
+	if useSys {
+		sys, err := startSysCapture(filepath.Join(sessionsDir(), "sys-"+ts+".flac"))
+		if err != nil {
+			m.notice = "system audio unavailable: " + err.Error() + " — recording mic only"
+			m.micFile = ""
+			// mic is already recording to the temp path; retarget is not
+			// possible mid-flight, so remember to rename at stop
+			m.micFile = micTarget
+		} else {
+			m.sysCap = sys
+			cmds = append(cmds, waitSysReady(sys), waitSysTick(sys.Ticks))
+		}
+	}
+	return m, tea.Batch(cmds...)
 }
 
 func (m model) startArmed() (tea.Model, tea.Cmd) {
@@ -936,6 +1061,10 @@ func (m model) updateRecordingKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case "p", " ":
+		if m.sysCap != nil {
+			m.notice = "pause is not available while capturing system audio"
+			return m, nil
+		}
 		if !armed && m.rec != nil {
 			if m.rec.Paused() {
 				if err := m.rec.Resume(); err != nil {
@@ -961,6 +1090,10 @@ func (m model) updateRecordingKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 // finishCapture stops whichever capture path is live and assembles m.file.
 func (m *model) finishCapture() error {
+	if m.captioner != nil {
+		m.captioner.Stop()
+		m.captioner = nil
+	}
 	if m.spool != nil {
 		segs := m.spool.Stop()
 		if m.meter != nil {
@@ -977,7 +1110,25 @@ func (m *model) finishCapture() error {
 		return err
 	}
 	if m.rec != nil {
-		return m.rec.Stop()
+		err := m.rec.Stop()
+		switch {
+		case m.sysCap != nil:
+			m.sysCap.Stop()
+			if err == nil {
+				err = mergeMicSystem(m.micFile, m.sysCap.File, m.file)
+			}
+			_ = os.Remove(m.micFile)
+			_ = os.Remove(m.sysCap.File)
+			m.sysCap = nil
+			m.micFile = ""
+		case m.micFile != "":
+			// system audio fell over mid-flight; keep the mic track
+			if err == nil {
+				err = os.Rename(m.micFile, m.file)
+			}
+			m.micFile = ""
+		}
+		return err
 	}
 	return fmt.Errorf("nothing was recording")
 }

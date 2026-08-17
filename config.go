@@ -10,10 +10,12 @@ import (
 type Config struct {
 	Device     string `json:"device"`
 	OutDir     string `json:"out_dir"`
-	Channels   int    `json:"channels"` // 1 = mono, 2 = stereo
-	Mode       string `json:"mode"`     // "record" or "armed"
+	Channels   int    `json:"channels"`     // 1 = mono, 2 = stereo
+	SystemAudio bool  `json:"system_audio"` // capture Teams/Zoom etc alongside the mic
+	Mode       string `json:"mode"`         // "record" or "armed"
 	BufferMin  int    `json:"buffer_min"`
-	Transcribe bool   `json:"transcribe"`
+	Transcribe   bool `json:"transcribe"`
+	LiveCaptions bool `json:"live_captions"` // rough on-GPU captions while recording
 	Model      string `json:"model"`
 	Speakers   int    `json:"speakers"` // 0 = auto
 	Language   string `json:"language"`

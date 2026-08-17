@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -84,6 +85,8 @@ func runDoctor() int {
 	check("whispermlx (transcription)", has("whispermlx"),
 		"uv tool install --python 3.13 --with 'numba>=0.61' whispermlx")
 	check("afplay (playback)", has("afplay"), "")
+	_, xcrunErr := exec.LookPath("xcrun")
+	check("xcrun/swiftc (system audio helper)", xcrunErr == nil, "xcode-select --install")
 	check("Hugging Face token (diarisation)", hfTokenPresent(),
 		"accept pyannote terms, save a read token to ~/.cache/huggingface/token")
 
