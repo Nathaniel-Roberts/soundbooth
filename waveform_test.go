@@ -46,11 +46,35 @@ func TestRenderWaveStereoLanes(t *testing.T) {
 
 func TestRulerAndVUBounds(t *testing.T) {
 	for _, w := range []int{1, 2, 5, 40, 200} {
-		_ = renderRuler(w) // must not panic at any width
+		for _, cellMs := range []int{0, 100, 200, 500} {
+			_ = renderRuler(w, cellMs, nil) // must not panic at any width
+			_ = renderRuler(w, cellMs, []int{0, 3, w - 1, w + 10, -2})
+		}
 	}
 	for _, lvl := range []float64{-0.5, 0, 0.5, 1, 1.5} {
 		_ = renderVU(5, lvl, lvl)
 		_ = renderVU(60, lvl, 1)
+	}
+}
+
+func TestDownsample(t *testing.T) {
+	cols := make([]waveCol, 10)
+	for i := range cols {
+		cols[i].peak = float64(i) / 10
+	}
+	cols[9].clip = true
+	out := downsample(cols, 5)
+	if len(out) != 2 {
+		t.Fatalf("expected 2 pooled columns, got %d", len(out))
+	}
+	if out[1].peak != 0.9 {
+		t.Errorf("max-pool lost the peak: %v", out[1].peak)
+	}
+	if !out[1].clip {
+		t.Error("max-pool lost the clip flag")
+	}
+	if got := downsample(cols, 1); len(got) != 10 {
+		t.Errorf("z=1 should be identity")
 	}
 }
 

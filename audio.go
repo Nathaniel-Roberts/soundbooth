@@ -194,11 +194,15 @@ func NewRecorder(device, file string, channels int) (*Recorder, error) {
 }
 
 func (r *Recorder) Start() error {
-	segDir, err := os.MkdirTemp("", "soundbooth-seg-*")
+	if err := os.MkdirAll(sessionsDir(), 0o755); err != nil {
+		return err
+	}
+	segDir, err := os.MkdirTemp(sessionsDir(), "rec-*")
 	if err != nil {
 		return err
 	}
 	r.segDir = segDir
+	_ = writeMeta(segDir, sessionMeta{File: r.file, Channels: r.channels, Started: time.Now()})
 
 	meter, err := startMeter(r.soxPath, r.device, r.channels)
 	if err != nil {
@@ -302,6 +306,42 @@ func (r *Recorder) Elapsed() time.Duration {
 		return r.recorded
 	}
 	return r.recorded + time.Since(r.segStart)
+}
+
+// Recover restarts capture after the record process died unexpectedly
+// (device unplugged, coreaudio hiccup). It retries the same device, then
+// falls back to the system default. It also revives the meter if needed.
+// Returns the device now in use, or an error if capture cannot continue.
+func (r *Recorder) Recover() (string, error) {
+	if err := r.startSegment(); err == nil {
+		r.reviveMeter()
+		return r.device, nil
+	}
+	if r.device != DefaultDevice {
+		r.device = DefaultDevice
+		if err := r.startSegment(); err == nil {
+			r.reviveMeter()
+			return r.device, nil
+		}
+	}
+	return r.device, fmt.Errorf("audio device lost and default input unavailable")
+}
+
+func (r *Recorder) reviveMeter() {
+	if r.Meter == nil {
+		return
+	}
+	select {
+	case _, open := <-r.Meter.Ticks:
+		if open {
+			return // meter alive; a dropped tick is harmless
+		}
+	default:
+		return // channel open and empty — meter alive
+	}
+	if m, err := startMeter(r.soxPath, r.device, r.channels); err == nil {
+		r.Meter = m
+	}
 }
 
 // Stop finalises capture and assembles the final file from the segments.

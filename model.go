@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -23,6 +24,8 @@ const (
 	screenArmed
 	screenRecording
 	screenTranscribing
+	screenSpeakers
+	screenLibrary
 	screenDone
 )
 
@@ -38,6 +41,7 @@ const (
 	fieldModel
 	fieldSpeakers
 	fieldLanguage
+	fieldTheme
 	fieldStart
 	fieldCount
 )
@@ -45,6 +49,7 @@ const (
 var modelChoices = []string{"large-v3-turbo", "large-v3", "medium", "small", "base"}
 var languageChoices = []string{"en", "auto"}
 var bufferChoices = []int{0, 5, 10, 15, 20, 30} // 0 = no buffer, record from trigger
+var zoomLevels = []int{1, 2, 5}                 // meter ticks per Braille sub-column
 
 type meterMsg MeterTick
 type meterClosedMsg struct{}
@@ -52,50 +57,7 @@ type recErrMsg struct{ err error }
 type transLineMsg string
 type transLinesClosedMsg struct{}
 type transDoneMsg struct{ err error }
-
-type model struct {
-	cfg    Config
-	scr    screen
-	width  int
-	height int
-
-	// setup
-	devices   []Device
-	devIdx    int
-	cursor    int
-	editing   bool
-	outInput  textinput.Model
-	nameInput textinput.Model
-	setupErr  string
-
-	// live capture (either mode)
-	rec       *Recorder // record-now mode
-	spool     *Spooler  // armed mode
-	meter     *Meter    // armed mode's meter (record mode uses rec.Meter)
-	armStart  time.Time
-	mark      time.Time // armed: when the save was triggered
-	file      string
-	name      string
-	wave      []waveCol
-	rmaxdb    float64
-	clips     int
-	clipTicks int
-	vuLevel   float64 // fast-attack / slow-release bar level, 0..1
-
-
-	// transcription
-	trans      *Transcriber
-	spin       spinner.Model
-	transLog   []string
-	transErr   error
-	didTrans   bool
-	preview    []string
-	showLog    bool
-	transStart time.Time
-	stage      int
-	stagePct   float64  // transcription stage progress 0..1
-	liveSegs   []string // transcript segments streaming in
-}
+type playDoneMsg struct{}
 
 // transcription pipeline stages, parsed from whispermlx output
 var stageNames = []string{"load model", "voice activity", "transcribe", "align", "diarise"}
@@ -119,8 +81,86 @@ func stageOf(line string) int {
 	return -1
 }
 
+type libEntry struct {
+	Path  string
+	Mod   time.Time
+	Size  int64
+	HasTx bool
+}
+
+type model struct {
+	cfg    Config
+	scr    screen
+	width  int
+	height int
+
+	// setup
+	devices   []Device
+	devIdx    int
+	cursor    int
+	editing   bool
+	outInput  textinput.Model
+	nameInput textinput.Model
+	setupErr  string
+	orphans   []orphan
+
+	// live capture (either mode)
+	rec       *Recorder // record-now mode
+	spool     *Spooler  // armed mode
+	meter     *Meter    // armed mode's meter (record mode uses rec.Meter)
+	armStart  time.Time
+	mark      time.Time // armed: when the save was triggered
+	file      string
+	name      string
+	wave      []waveCol
+	rmaxdb    float64
+	clips     int
+	clipTicks int
+	vuLevel   float64 // fast-attack / slow-release bar level, 0..1
+	markers   []time.Duration
+	zoomIdx   int
+	notice    string
+	diskFree  int64
+	diskTick  int
+
+	// transcription
+	trans      *Transcriber
+	txDir      string
+	spin       spinner.Model
+	transLog   []string
+	transErr   error
+	didTrans   bool
+	preview    []string
+	showLog    bool
+	transStart time.Time
+	stage      int
+	stagePct   float64  // transcription stage progress 0..1
+	liveSegs   []string // transcript segments streaming in
+
+	// speakers
+	segs      []wSeg
+	stats     []spkStat
+	spkCursor int
+	spkEdit   bool
+	spkInput  textinput.Model
+
+	// done / library
+	transcriptMD string
+	markersFile  string
+	playCmd      *exec.Cmd
+	playing      bool
+	postStatus   string
+	postRan      bool
+	lib          []libEntry
+	libCursor    int
+	libConfirm   bool
+	fromLib      bool
+}
+
 func newModel() model {
 	cfg := loadConfig()
+	applyTheme(applyOverrides(themeByName(cfg.Theme), cfg.ThemeColors))
+	sweepStaleSpools()
 
 	devices := listInputDevices()
 	devIdx := 0
@@ -140,8 +180,12 @@ func newModel() model {
 	name.CharLimit = 64
 	name.Prompt = ""
 
+	spk := textinput.New()
+	spk.CharLimit = 48
+	spk.Prompt = ""
+
 	sp := spinner.New(spinner.WithSpinner(spinner.MiniDot))
-	sp.Style = lipgloss.NewStyle().Foreground(mochaBlue)
+	sp.Style = lipgloss.NewStyle().Foreground(lipgloss.Color(th.Blue))
 
 	return model{
 		cfg:       cfg,
@@ -150,8 +194,10 @@ func newModel() model {
 		devIdx:    devIdx,
 		outInput:  out,
 		nameInput: name,
+		spkInput:  spk,
 		spin:      sp,
 		rmaxdb:    -99,
+		orphans:   findOrphans(),
 	}
 }
 
@@ -168,6 +214,9 @@ func (m *model) ticks() chan MeterTick {
 }
 
 func waitMeter(ch chan MeterTick) tea.Cmd {
+	if ch == nil {
+		return nil
+	}
 	return func() tea.Msg {
 		t, ok := <-ch
 		if !ok {
@@ -195,6 +244,13 @@ func waitTransDone(ch chan error) tea.Cmd {
 	return func() tea.Msg { return transDoneMsg{<-ch} }
 }
 
+func waitPlay(cmd *exec.Cmd) tea.Cmd {
+	return func() tea.Msg {
+		_ = cmd.Wait()
+		return playDoneMsg{}
+	}
+}
+
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
@@ -218,10 +274,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.showLog = !m.showLog
 			}
 			return m, nil
+		case screenSpeakers:
+			return m.updateSpeakerKeys(msg)
+		case screenLibrary:
+			return m.updateLibraryKeys(msg)
 		case screenDone:
 			return m.updateDoneKeys(msg)
 		}
 		return m, nil
+
+	case remoteCmdMsg:
+		return m.handleRemote(msg.cmd)
 
 	case meterMsg:
 		if m.scr != screenRecording && m.scr != screenArmed {
@@ -234,14 +297,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			col.clip = false
 		}
 		m.wave = append(m.wave, col)
-		if len(m.wave) > 2048 {
-			m.wave = m.wave[len(m.wave)-1024:]
+		if len(m.wave) > 8192 {
+			m.wave = m.wave[len(m.wave)-4096:]
 		}
 		m.rmaxdb -= 0.5 // decays 10 dB/s at 20 ticks/s
 		if t.DB > m.rmaxdb {
 			m.rmaxdb = t.DB
 		}
-		// VU ballistics: instant attack, exponential release
 		target := t.Peak
 		if t.PeakR > target {
 			target = t.PeakR
@@ -257,17 +319,45 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else if m.clipTicks > 0 {
 			m.clipTicks--
 		}
+		if m.diskTick++; m.diskTick >= 100 { // every ~5 s
+			m.diskTick = 0
+			m.diskFree = freeBytes(m.cfg.OutDir)
+		}
 		return m, waitMeter(m.ticks())
 
 	case meterClosedMsg:
+		// The metering stream died (device change?). Try to revive it so
+		// the display keeps moving; capture recovery is recErrMsg's job.
+		if m.scr == screenRecording || m.scr == screenArmed {
+			if m.meter != nil {
+				if soxPath, err := findBin("sox"); err == nil {
+					if nm, err := startMeter(soxPath, m.cfg.Device, m.cfg.Channels); err == nil {
+						m.meter = nm
+						return m, waitMeter(nm.Ticks)
+					}
+				}
+			} else if m.rec != nil {
+				m.rec.reviveMeter()
+				return m, waitMeter(m.ticks())
+			}
+		}
 		return m, nil
 
 	case recErrMsg:
-		if (m.scr == screenRecording || m.scr == screenArmed) && msg.err != nil {
-			m.teardown()
-			m.setupErr = msg.err.Error()
-			m.scr = screenSetup
+		if m.scr != screenRecording || msg.err == nil || m.rec == nil {
+			return m, nil
 		}
+		dev, err := m.rec.Recover()
+		if err == nil {
+			m.notice = "input device hiccup — capture continued on " + dev
+			m.markers = append(m.markers, m.liveElapsed())
+			return m, tea.Batch(waitRecErr(m.rec.Err), waitMeter(m.ticks()))
+		}
+		// Cannot continue: salvage what we have.
+		_ = m.rec.Stop()
+		m.notice = "recording stopped: " + err.Error()
+		m.finishFiles()
+		m.scr = screenDone
 		return m, nil
 
 	case transLineMsg:
@@ -298,10 +388,33 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case transDoneMsg:
 		m.transErr = msg.err
 		m.didTrans = msg.err == nil
-		if m.didTrans {
-			m.preview = transcriptPreview(m.trans.OutDir, m.file, 6)
+		if !m.didTrans {
+			m.scr = screenDone
+			return m, nil
 		}
-		m.scr = screenDone
+		m.txDir = m.trans.OutDir
+		m.preview = transcriptPreview(m.txDir, m.file, 6)
+		m.segs = loadSegments(m.txDir, m.file)
+		m.stats = speakerStats(m.segs)
+		if len(m.stats) > 1 {
+			m.spkCursor = 0
+			m.spkEdit = false
+			m.scr = screenSpeakers
+			return m, nil
+		}
+		return m.enterDone()
+
+	case postDoneMsg:
+		if msg.err != nil {
+			m.postStatus = "post-hook failed: " + msg.err.Error()
+		} else {
+			m.postStatus = "post-hook: done"
+		}
+		return m, nil
+
+	case playDoneMsg:
+		m.playing = false
+		m.playCmd = nil
 		return m, nil
 
 	case spinner.TickMsg:
@@ -315,6 +428,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	if m.editing {
 		return m.updateEditing(msg)
+	}
+	if m.spkEdit {
+		return m.updateSpeakerEdit(msg)
 	}
 	return m, nil
 }
@@ -334,6 +450,39 @@ func (m *model) teardown() {
 		m.meter.Stop()
 		m.meter = nil
 	}
+	if m.playCmd != nil && m.playCmd.Process != nil {
+		_ = m.playCmd.Process.Kill()
+	}
+}
+
+func (m *model) liveElapsed() time.Duration {
+	switch {
+	case m.spool != nil && !m.mark.IsZero():
+		return time.Since(m.mark)
+	case m.rec != nil:
+		return m.rec.Elapsed()
+	default:
+		return 0
+	}
+}
+
+// handleRemote services control-socket commands from `soundbooth <cmd>`.
+func (m model) handleRemote(cmd string) (tea.Model, tea.Cmd) {
+	switch cmd {
+	case "trigger":
+		if m.scr == screenArmed {
+			return m.updateArmedKeys(tea.KeyMsg{Type: tea.KeyEnter})
+		}
+	case "stop":
+		if m.scr == screenRecording {
+			return m.updateRecordingKeys(tea.KeyMsg{Type: tea.KeyEnter})
+		}
+	case "marker":
+		if m.scr == screenRecording && !(m.rec != nil && m.rec.Paused()) {
+			m.markers = append(m.markers, m.liveElapsed())
+		}
+	}
+	return m, nil
 }
 
 // --- setup ---
@@ -345,6 +494,21 @@ func (m model) updateSetupKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "q", "esc":
 		return m, tea.Quit
+	case "b":
+		m.lib = loadLibrary(expandHome(strings.TrimSpace(m.outInput.Value())))
+		m.libCursor = 0
+		m.libConfirm = false
+		m.scr = screenLibrary
+		return m, nil
+	case "r":
+		if len(m.orphans) > 0 {
+			return m.recoverOrphan(m.orphans[0])
+		}
+	case "d":
+		if len(m.orphans) > 0 {
+			_ = os.RemoveAll(m.orphans[0].Dir)
+			m.orphans = findOrphans()
+		}
 	case "up", "k":
 		if m.cursor > 0 {
 			m.cursor--
@@ -375,6 +539,36 @@ func (m model) updateSetupKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.adjustField(1)
 		}
 	}
+	return m, nil
+}
+
+func (m model) recoverOrphan(o orphan) (tea.Model, tea.Cmd) {
+	soxPath, err := findBin("sox")
+	if err != nil {
+		m.setupErr = err.Error()
+		return m, nil
+	}
+	file := o.Meta.File
+	if file == "" {
+		file = filepath.Join(expandHome(strings.TrimSpace(m.outInput.Value())),
+			fmt.Sprintf("recovered-%s.flac", time.Now().Format("20060102-150405")))
+	}
+	if err := os.MkdirAll(filepath.Dir(file), 0o755); err != nil {
+		m.setupErr = err.Error()
+		return m, nil
+	}
+	if err := concatFlac(soxPath, o.Segments, file); err != nil {
+		m.setupErr = "recovery failed: " + err.Error()
+		return m, nil
+	}
+	_ = os.RemoveAll(o.Dir)
+	m.orphans = findOrphans()
+	m.file = file
+	m.didTrans = false
+	m.transErr = nil
+	m.notice = "recovered from unfinished session"
+	m.markers = nil
+	m.scr = screenDone
 	return m, nil
 }
 
@@ -418,6 +612,13 @@ func (m *model) adjustField(dir int) {
 	case fieldLanguage:
 		i := indexOf(languageChoices, m.cfg.Language)
 		m.cfg.Language = languageChoices[(i+dir+len(languageChoices))%len(languageChoices)]
+	case fieldTheme:
+		names := themeNames()
+		i := indexOf(names, m.cfg.Theme)
+		m.cfg.Theme = names[(i+dir+len(names))%len(names)]
+		applyTheme(applyOverrides(themeByName(m.cfg.Theme), m.cfg.ThemeColors))
+		m.spin.Style = lipgloss.NewStyle().Foreground(lipgloss.Color(th.Blue))
+		_ = m.cfg.save()
 	}
 }
 
@@ -467,6 +668,13 @@ func (m model) start() (tea.Model, tea.Cmd) {
 	m.rmaxdb = -99
 	m.clips = 0
 	m.clipTicks = 0
+	m.vuLevel = 0
+	m.markers = nil
+	m.notice = ""
+	m.postStatus = ""
+	m.postRan = false
+	m.fromLib = false
+	m.diskFree = freeBytes(m.cfg.OutDir)
 
 	if m.cfg.Mode == "armed" {
 		return m.startArmed()
@@ -563,16 +771,31 @@ func (m model) updateRecordingKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.scr = screenDone
 			return m, nil
 		}
+		m.finishFiles()
 		if m.cfg.Transcribe {
 			return m.beginTranscribe()
 		}
-		m.scr = screenDone
+		return m.enterDone()
+	case "m":
+		if !(m.rec != nil && m.rec.Paused()) {
+			m.markers = append(m.markers, m.liveElapsed())
+		}
+		return m, nil
+	case "+", "=":
+		if m.zoomIdx > 0 {
+			m.zoomIdx--
+		}
+		return m, nil
+	case "-", "_":
+		if m.zoomIdx < len(zoomLevels)-1 {
+			m.zoomIdx++
+		}
 		return m, nil
 	case "p", " ":
 		if !armed && m.rec != nil {
 			if m.rec.Paused() {
 				if err := m.rec.Resume(); err != nil {
-					m.setupErr = err.Error()
+					m.notice = err.Error()
 				}
 			} else {
 				m.rec.Pause()
@@ -584,6 +807,7 @@ func (m model) updateRecordingKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if err := m.finishCapture(); err != nil {
 			m.transErr = err
 		}
+		m.finishFiles()
 		m.scr = screenDone
 		return m, nil
 	}
@@ -613,6 +837,11 @@ func (m *model) finishCapture() error {
 	return fmt.Errorf("nothing was recording")
 }
 
+// finishFiles writes capture side-artifacts (markers).
+func (m *model) finishFiles() {
+	m.markersFile = writeMarkersFile(m.file, m.markers)
+}
+
 func (m model) beginTranscribe() (tea.Model, tea.Cmd) {
 	trans, err := startTranscribe(m.file, m.cfg.Model, m.cfg.Language, m.cfg.Speakers)
 	if err != nil {
@@ -625,19 +854,202 @@ func (m model) beginTranscribe() (tea.Model, tea.Cmd) {
 	m.liveSegs = nil
 	m.stage = 0
 	m.stagePct = 0
+	m.showLog = false
+	m.postRan = false // a fresh transcription earns a fresh post-hook run
 	m.transStart = time.Now()
 	m.scr = screenTranscribing
 	return m, tea.Batch(m.spin.Tick, waitTransLine(trans.Lines), waitTransDone(trans.Done))
+}
+
+// --- speakers ---
+
+func (m model) updateSpeakerKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.spkEdit {
+		return m.updateSpeakerEdit(msg)
+	}
+	switch msg.String() {
+	case "up", "k":
+		if m.spkCursor > 0 {
+			m.spkCursor--
+		}
+	case "down", "j", "tab":
+		if m.spkCursor < len(m.stats)-1 {
+			m.spkCursor++
+		}
+	case "enter":
+		m.spkEdit = true
+		m.spkInput.SetValue(m.stats[m.spkCursor].Name)
+		m.spkInput.Focus()
+		return m, textinput.Blink
+	case "c", "s":
+		return m.applySpeakers()
+	}
+	return m, nil
+}
+
+func (m model) updateSpeakerEdit(msg tea.Msg) (tea.Model, tea.Cmd) {
+	if key, ok := msg.(tea.KeyMsg); ok {
+		switch key.String() {
+		case "enter", "esc":
+			if key.String() == "enter" {
+				m.stats[m.spkCursor].Name = strings.TrimSpace(m.spkInput.Value())
+			}
+			m.spkEdit = false
+			m.spkInput.Blur()
+			return m, nil
+		}
+	}
+	var cmd tea.Cmd
+	m.spkInput, cmd = m.spkInput.Update(msg)
+	return m, cmd
+}
+
+func (m model) applySpeakers() (tea.Model, tea.Cmd) {
+	if path, err := writeNamedTranscript(m.txDir, m.file, m.segs, m.stats, m.markers); err == nil {
+		m.transcriptMD = path
+	}
+	return m.enterDone()
+}
+
+// enterDone lands on the done screen; fires the post-hook once per
+// successful transcription.
+func (m model) enterDone() (tea.Model, tea.Cmd) {
+	if m.didTrans && m.transcriptMD == "" && len(m.segs) > 0 {
+		if path, err := writeNamedTranscript(m.txDir, m.file, m.segs, m.stats, m.markers); err == nil {
+			m.transcriptMD = path
+		}
+	}
+	m.scr = screenDone
+	if m.didTrans && !m.postRan && m.cfg.PostCommand != "" {
+		m.postRan = true
+		m.postStatus = "post-hook: running..."
+		return m, runPostHook(m.cfg.PostCommand, m.file, m.txDir, m.transcriptMD, m.markersFile)
+	}
+	return m, nil
+}
+
+// --- library ---
+
+func loadLibrary(dir string) []libEntry {
+	matches, _ := filepath.Glob(filepath.Join(dir, "*.flac"))
+	var out []libEntry
+	for _, p := range matches {
+		info, err := os.Stat(p)
+		if err != nil {
+			continue
+		}
+		stem := strings.TrimSuffix(p, filepath.Ext(p))
+		txInfo, err := os.Stat(stem)
+		e := libEntry{Path: p, Mod: info.ModTime(), Size: info.Size(),
+			HasTx: err == nil && txInfo.IsDir()}
+		out = append(out, e)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Mod.After(out[j].Mod) })
+	if len(out) > 200 {
+		out = out[:200]
+	}
+	return out
+}
+
+func (m model) updateLibraryKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.libConfirm {
+		switch msg.String() {
+		case "y":
+			e := m.lib[m.libCursor]
+			_ = os.Remove(e.Path)
+			_ = os.RemoveAll(strings.TrimSuffix(e.Path, filepath.Ext(e.Path)))
+			for _, suffix := range []string{"-markers.txt"} {
+				_ = os.Remove(strings.TrimSuffix(e.Path, filepath.Ext(e.Path)) + suffix)
+			}
+			m.lib = loadLibrary(m.cfg.OutDir)
+			if m.libCursor >= len(m.lib) && m.libCursor > 0 {
+				m.libCursor--
+			}
+		}
+		m.libConfirm = false
+		return m, nil
+	}
+	switch msg.String() {
+	case "esc", "q", "b":
+		m.scr = screenSetup
+	case "up", "k":
+		if m.libCursor > 0 {
+			m.libCursor--
+		}
+	case "down", "j":
+		if m.libCursor < len(m.lib)-1 {
+			m.libCursor++
+		}
+	case "d":
+		if len(m.lib) > 0 {
+			m.libConfirm = true
+		}
+	case "o":
+		_ = exec.Command("open", m.cfg.OutDir).Start()
+	case "enter":
+		if len(m.lib) == 0 {
+			return m, nil
+		}
+		e := m.lib[m.libCursor]
+		m.file = e.Path
+		m.didTrans = e.HasTx
+		m.transErr = nil
+		m.transcriptMD = ""
+		m.markers = nil
+		m.markersFile = ""
+		m.postRan = true // never auto-run hooks on old recordings
+		m.postStatus = ""
+		m.notice = ""
+		m.fromLib = true
+		if e.HasTx {
+			m.txDir = strings.TrimSuffix(e.Path, filepath.Ext(e.Path))
+			m.preview = transcriptPreview(m.txDir, e.Path, 6)
+			m.segs = loadSegments(m.txDir, e.Path)
+			m.stats = speakerStats(m.segs)
+			md := filepath.Join(m.txDir, audioStem(e.Path)+"-transcript.md")
+			if _, err := os.Stat(md); err == nil {
+				m.transcriptMD = md
+			}
+		} else {
+			m.txDir = ""
+			m.preview = nil
+			m.segs = nil
+			m.stats = nil
+		}
+		m.scr = screenDone
+	}
+	return m, nil
 }
 
 // --- done ---
 
 func (m model) updateDoneKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
-	case "q", "esc":
+	case "q":
+		m.teardown()
+		return m, tea.Quit
+	case "esc":
+		if m.fromLib {
+			m.stopPlayback()
+			m.lib = loadLibrary(m.cfg.OutDir)
+			m.scr = screenLibrary
+			return m, nil
+		}
+		m.teardown()
 		return m, tea.Quit
 	case "o":
 		_ = exec.Command("open", filepath.Dir(m.file)).Start()
+	case "p":
+		if m.playing {
+			m.stopPlayback()
+			return m, nil
+		}
+		cmd := exec.Command("afplay", m.file)
+		if err := cmd.Start(); err == nil {
+			m.playCmd = cmd
+			m.playing = true
+			return m, waitPlay(cmd)
+		}
 	case "t":
 		if !m.didTrans && m.file != "" {
 			if _, err := os.Stat(m.file); err == nil {
@@ -646,6 +1058,7 @@ func (m model) updateDoneKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 		}
 	case "n":
+		m.stopPlayback()
 		fresh := newModel()
 		fresh.width, fresh.height = m.width, m.height
 		return fresh, nil
@@ -653,10 +1066,16 @@ func (m model) updateDoneKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m *model) stopPlayback() {
+	if m.playCmd != nil && m.playCmd.Process != nil {
+		_ = m.playCmd.Process.Kill()
+	}
+	m.playing = false
+	m.playCmd = nil
+}
+
 func transcriptPreview(outDir, audioFile string, lines int) []string {
-	base := filepath.Base(audioFile)
-	stem := strings.TrimSuffix(base, filepath.Ext(base))
-	data, err := os.ReadFile(filepath.Join(outDir, stem+".txt"))
+	data, err := os.ReadFile(filepath.Join(outDir, audioStem(audioFile)+".txt"))
 	if err != nil {
 		return nil
 	}
@@ -680,311 +1099,4 @@ func expandHome(p string) string {
 		return filepath.Join(home, p[2:])
 	}
 	return p
-}
-
-// --- views ---
-
-func (m model) View() string {
-	var body string
-	switch m.scr {
-	case screenSetup:
-		body = m.viewSetup()
-	case screenArmed:
-		body = m.viewLive()
-	case screenRecording:
-		body = m.viewLive()
-	case screenTranscribing:
-		body = m.viewTranscribing()
-	case screenDone:
-		body = m.viewDone()
-	}
-	header := titleStyle.Render("soundbooth") + dimStyle.Render("  record · meter · transcribe")
-	return lipgloss.JoinVertical(lipgloss.Left, header, "", body)
-}
-
-func (m model) viewSetup() string {
-	speakers := "auto"
-	if m.cfg.Speakers > 0 {
-		speakers = strconv.Itoa(m.cfg.Speakers)
-	}
-	onOff := func(b bool, on, off string) string {
-		if b {
-			return on
-		}
-		return off
-	}
-	mode := "record now"
-	startLabel := "[ Start recording ]"
-	if m.cfg.Mode == "armed" {
-		mode = "armed (replay buffer)"
-		startLabel = "[ Arm replay buffer ]"
-	}
-	rows := []struct {
-		label, value string
-	}{
-		{"Microphone", m.devices[m.devIdx].Name},
-		{"Save to", m.outInput.View()},
-		{"Name", m.nameInput.View()},
-		{"Channels", onOff(m.cfg.Channels == 2, "stereo", "mono")},
-		{"Mode", mode},
-		{"Buffer", bufferLabel(m.cfg.BufferMin)},
-		{"Transcribe", onOff(m.cfg.Transcribe, "on", "off")},
-		{"Whisper model", m.cfg.Model},
-		{"Speakers", speakers},
-		{"Language", m.cfg.Language},
-		{"", startLabel},
-	}
-	var b strings.Builder
-	for i, r := range rows {
-		cursor := "  "
-		style := valueStyle
-		if i == m.cursor {
-			cursor = focusStyle.Render("> ")
-			style = focusStyle
-		}
-		if i == fieldBuffer && m.cfg.Mode != "armed" && i != m.cursor {
-			style = dimStyle
-		}
-		if r.label == "" {
-			b.WriteString(fmt.Sprintf("%s%s\n", cursor, style.Render(r.value)))
-			continue
-		}
-		b.WriteString(fmt.Sprintf("%s%s  %s\n", cursor,
-			labelStyle.Render(fmt.Sprintf("%-14s", r.label)), style.Render(r.value)))
-	}
-	out := panelStyle.Render(strings.TrimRight(b.String(), "\n"))
-	var notes []string
-	if m.cfg.Transcribe && !hfTokenPresent() {
-		notes = append(notes, warnStyle.Render("no Hugging Face token (~/.cache/huggingface/token) — transcription will fail"))
-	}
-	if m.setupErr != "" {
-		notes = append(notes, errStyle.Render(m.setupErr))
-	}
-	hints := keyHint("↑↓", "move", "←→", "change", "enter", "edit/start", "q", "quit")
-	parts := append([]string{out}, notes...)
-	parts = append(parts, "", hints)
-	return lipgloss.JoinVertical(lipgloss.Left, parts...)
-}
-
-func (m model) viewLive() string {
-	wCells := m.width - 6
-	if wCells < 20 {
-		wCells = 60
-	}
-	hCells := m.height - 13
-	if hCells > 14 {
-		hCells = 14
-	}
-	if hCells < 5 {
-		hCells = 5
-	}
-	var wave string
-	if m.cfg.Channels == 2 {
-		wave = renderWaveStereo(m.wave, wCells, hCells)
-	} else {
-		wave = renderWave(m.wave, wCells, hCells)
-	}
-	wave += "\n" + renderRuler(wCells)
-
-	panel := panelStyle
-	if m.clipTicks > 0 {
-		panel = panel.BorderForeground(mochaRed)
-	}
-
-	var levelStyle lipgloss.Style
-	var advice string
-	switch {
-	case m.clipTicks > 0:
-		levelStyle, advice = errStyle, fmt.Sprintf("CLIPPING (%d) — gain down", m.clips)
-	case m.rmaxdb > -5:
-		levelStyle, advice = warnStyle, "hot — nudge gain down"
-	case m.rmaxdb < -30:
-		levelStyle, advice = warnStyle, "quiet — gain up?"
-	default:
-		levelStyle, advice = okStyle, "level OK"
-	}
-	level := levelStyle.Render(fmt.Sprintf("peak %d dB  %s", int(m.rmaxdb), advice))
-
-	var badge, detail, hints string
-	switch {
-	case m.scr == screenArmed && m.spool == nil:
-		badge = warnStyle.Render("● STANDBY")
-		detail = dimStyle.Render("no buffer — nothing is recorded until you press enter")
-		hints = keyHint("enter", "start recording", "x", "back to setup", "ctrl+c", "quit")
-	case m.scr == screenArmed:
-		buffered := time.Since(m.armStart)
-		window := time.Duration(m.cfg.BufferMin) * time.Minute
-		if buffered > window {
-			buffered = window
-		}
-		badge = warnStyle.Render("● ARMED")
-		detail = dimStyle.Render(fmt.Sprintf("buffered %s of last %d min — nothing kept unless you save",
-			fmtDur(buffered), m.cfg.BufferMin))
-		hints = keyHint("enter", fmt.Sprintf("save last %d min + keep recording", m.cfg.BufferMin), "x", "disarm (discard)", "ctrl+c", "quit")
-	case m.spool != nil:
-		badge = errStyle.Render("● REC")
-		detail = dimStyle.Render(fmt.Sprintf("%s + the %d min before the trigger  ·  %s",
-			fmtDur(time.Since(m.mark)), m.cfg.BufferMin, filepath.Base(m.file)))
-		hints = keyHint("enter", "stop"+transcribeSuffix(m.cfg.Transcribe), "x", "stop, skip transcribe", "ctrl+c", "abort")
-	case m.rec != nil && m.rec.Paused():
-		badge = warnStyle.Render("● PAUSED")
-		detail = dimStyle.Render(fmt.Sprintf("%s recorded  ·  %s  %s",
-			fmtDur(m.rec.Elapsed()), filepath.Base(m.file), humanSize(m.rec.FileSize())))
-		hints = keyHint("p", "resume", "enter", "stop"+transcribeSuffix(m.cfg.Transcribe), "x", "stop, skip transcribe")
-	default:
-		badge = errStyle.Render("● REC")
-		detail = dimStyle.Render(fmt.Sprintf("%s  ·  %s  %s",
-			fmtDur(m.rec.Elapsed()), filepath.Base(m.file), humanSize(m.rec.FileSize())))
-		hints = keyHint("p", "pause", "enter", "stop"+transcribeSuffix(m.cfg.Transcribe), "x", "stop, skip transcribe")
-	}
-
-	hold := (m.rmaxdb - dbFloor) / -dbFloor
-	if hold < 0 {
-		hold = 0
-	}
-	if hold > 1 {
-		hold = 1
-	}
-	vuWidth := wCells - 30
-	if vuWidth > 60 {
-		vuWidth = 60
-	}
-	if vuWidth < 16 {
-		vuWidth = 16
-	}
-	vu := renderVU(vuWidth, m.vuLevel, hold)
-
-	status := badge + "  " + level + "  " + detail
-	return lipgloss.JoinVertical(lipgloss.Left, panel.Render(wave), status, vu, "", hints)
-}
-
-func bufferLabel(minutes int) string {
-	if minutes == 0 {
-		return "off — record from trigger (armed mode)"
-	}
-	return fmt.Sprintf("last %d min (armed mode)", minutes)
-}
-
-func fmtDur(d time.Duration) string {
-	d = d.Round(time.Second)
-	return fmt.Sprintf("%02d:%02d", int(d.Minutes()), int(d.Seconds())%60)
-}
-
-func transcribeSuffix(on bool) string {
-	if on {
-		return " + transcribe"
-	}
-	return ""
-}
-
-func (m model) viewTranscribing() string {
-	head := fmt.Sprintf("%s %s  %s", m.spin.View(),
-		valueStyle.Render("transcribing "+filepath.Base(m.file)),
-		dimStyle.Render(fmt.Sprintf("%s · %s · Apple GPU", m.cfg.Model, fmtDur(time.Since(m.transStart)))))
-
-	if m.showLog {
-		tail := m.transLog
-		maxLines := m.height - 10
-		if maxLines < 4 {
-			maxLines = 4
-		}
-		if len(tail) > maxLines {
-			tail = tail[len(tail)-maxLines:]
-		}
-		return lipgloss.JoinVertical(lipgloss.Left, head, "",
-			panelStyle.Render(dimStyle.Render(strings.Join(tail, "\n"))), "",
-			keyHint("l", "hide log", "ctrl+c", "abort"))
-	}
-
-	var b strings.Builder
-	for i, name := range stageNames {
-		switch {
-		case i < m.stage:
-			b.WriteString(okStyle.Render("  ✓ ") + dimStyle.Render(name))
-		case i == m.stage:
-			b.WriteString("  " + m.spin.View() + " " + focusStyle.Render(name))
-			if i == 2 && m.stagePct > 0 {
-				b.WriteString("  " + renderProgress(24, m.stagePct) +
-					dimStyle.Render(fmt.Sprintf(" %3.0f%%", m.stagePct*100)))
-			}
-		default:
-			b.WriteString(dimStyle.Render("  · " + name))
-		}
-		b.WriteByte('\n')
-	}
-	body := strings.TrimRight(b.String(), "\n")
-
-	if len(m.liveSegs) > 0 {
-		body += "\n\n" + labelStyle.Render("  hearing:")
-		for _, s := range m.liveSegs {
-			if len(s) > 90 {
-				s = s[:90] + "…"
-			}
-			body += "\n" + dimStyle.Render("    "+s)
-		}
-	}
-	return lipgloss.JoinVertical(lipgloss.Left, head, "",
-		panelStyle.Render(body), "",
-		keyHint("l", "show log", "ctrl+c", "abort"))
-}
-
-// renderProgress draws a gradient progress bar, frac 0..1.
-func renderProgress(width int, frac float64) string {
-	if frac < 0 {
-		frac = 0
-	}
-	if frac > 1 {
-		frac = 1
-	}
-	fill := int(frac*float64(width) + 0.5)
-	var b strings.Builder
-	for i := 0; i < width; i++ {
-		if i < fill {
-			t := float64(i) / float64(width-1)
-			b.WriteString(lipgloss.NewStyle().
-				Foreground(lipgloss.Color(waveRamp(t))).Render("█"))
-		} else {
-			b.WriteString(lipgloss.NewStyle().Foreground(mochaSurface0).Render("░"))
-		}
-	}
-	return b.String()
-}
-
-func (m model) viewDone() string {
-	var lines []string
-	lines = append(lines, okStyle.Render("recording saved  ")+valueStyle.Render(m.file))
-	switch {
-	case m.didTrans && m.trans != nil:
-		lines = append(lines, okStyle.Render("transcript in    ")+valueStyle.Render(m.trans.OutDir))
-		if len(m.preview) > 0 {
-			lines = append(lines, "")
-			for _, p := range m.preview {
-				if len(p) > 100 {
-					p = p[:100] + "…"
-				}
-				lines = append(lines, dimStyle.Render("  "+p))
-			}
-		}
-	case m.transErr != nil:
-		lines = append(lines, errStyle.Render("transcription failed: "+m.transErr.Error()))
-		lines = append(lines, dimStyle.Render("the recording is safe — press t to retry"))
-	}
-	hintPairs := []string{"n", "new recording", "o", "open folder", "q", "quit"}
-	if !m.didTrans {
-		hintPairs = append([]string{"t", "transcribe"}, hintPairs...)
-	}
-	hints := keyHint(hintPairs...)
-	return lipgloss.JoinVertical(lipgloss.Left,
-		panelStyle.Render(strings.Join(lines, "\n")), "", hints)
-}
-
-func humanSize(n int64) string {
-	switch {
-	case n > 1<<20:
-		return fmt.Sprintf("%.1f MB", float64(n)/(1<<20))
-	case n > 1<<10:
-		return fmt.Sprintf("%.0f KB", float64(n)/(1<<10))
-	default:
-		return fmt.Sprintf("%d B", n)
-	}
 }

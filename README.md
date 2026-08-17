@@ -16,37 +16,79 @@ Catppuccin Mocha throughout.
 ## Requirements
 
 - Apple silicon Mac
-- `sox` (capture) and `ffmpeg` (device listing) — via nix or brew
+- `sox` (capture) and `ffmpeg` (device listing, armed-mode buffer) — via
+  nix or brew (the nix flake package wraps both onto PATH)
 - `whispermlx` for transcription (`uv tool install --python 3.13 --with 'numba>=0.61' whispermlx`)
 - A Hugging Face read token at `~/.cache/huggingface/token` with the
   pyannote `speaker-diarization-community-1` terms accepted (diarisation)
 
-## Run
+Run `soundbooth doctor` to check all of the above.
+
+## Install
 
 ```
+nix profile install .#soundbooth    # or add the flake to your config
+# or
 go build -o soundbooth . && ./soundbooth
 ```
 
-`soundbooth --devices` lists capture devices without starting the TUI.
+## CLI
+
+```
+soundbooth            # the TUI
+soundbooth doctor     # toolchain check
+soundbooth devices    # list capture devices
+soundbooth trigger    # remote: save the armed buffer / start from standby
+soundbooth marker     # remote: drop a marker in the current recording
+soundbooth stop       # remote: stop and transcribe
+```
+
+The remote commands talk to a running instance over a unix socket
+(`~/.local/state/soundbooth/control.sock`) — bind them to Stream Deck
+keys or a global hotkey so armed mode never needs the terminal focused.
+
+## A note on recording people
+
+soundbooth assumes you know and follow your local rules on recording
+conversations (in NSW that is the Surveillance Devices Act 2007, which
+generally requires the consent of the people in the conversation). Armed
+mode is designed to be consent-friendly — the buffer is continuously
+discarded and nothing is kept without an explicit save — but the law
+cares about the recording, not the retention policy. Tell people.
 
 ## Screens
 
 1. **Setup** — microphone, save directory, name, mono/stereo, mode
-   (record now / armed replay buffer), buffer length, transcribe on/off,
-   whisper model, speaker count, language. Choices persist in
-   `~/.config/soundbooth/config.json`.
-2. **Recording** — live waveform (blue peak envelope, lavender RMS core,
-   red clipped columns, Braille dots for 2x4 sub-cell resolution; split
-   L/R lanes in stereo), elapsed time, decaying peak dB with gain advice
-   (level OK / quiet / hot / CLIPPING). `p` pauses (segments concatenate
-   seamlessly, paused spans show grey in the waveform); enter stops and
-   transcribes; `x` stops and skips.
+   (record now / armed replay buffer / armed with no buffer), buffer
+   length, transcribe on/off, whisper model, speaker count, language,
+   theme (all four Catppuccin flavours, live preview; per-colour
+   overrides via `theme_colors` in the config). Choices persist in
+   `~/.config/soundbooth/config.json`. `b` opens the recording library.
+   If a previous session crashed, a recovery banner offers to salvage it.
+2. **Recording** — live gradient waveform (Braille dots, vertical
+   lavender-to-sapphire ramp, red clipped columns; split L/R lanes in
+   stereo), DAW-style time ruler with marker arrows, VU meter with
+   peak-hold, decaying peak dB with gain advice, low-disk warning.
+   `m` drops a marker, `+`/`-` zooms the timebase, `p` pauses (paused
+   spans render grey; segments concatenate seamlessly), enter stops and
+   transcribes, `x` stops and skips. If the input device dies mid-take,
+   capture recovers onto the default mic and drops an automatic marker.
 3. **Armed** — the replay buffer. Live waveform while buffering; enter
-   saves the last N minutes and keeps recording; `x` disarms and discards.
-4. **Transcribing** — streamed whispermlx output.
-5. **Done** — file and transcript paths with a transcript preview;
-   `t` (re)transcribes if it was skipped or failed, `n` new recording,
-   `o` open folder.
+   saves the last N minutes and keeps recording; `x` disarms and
+   discards. With buffer off it is a pure standby screen: metered, but
+   nothing written until triggered.
+4. **Transcribing** — stage checklist with a live progress bar and a
+   preview of segments as they stream in; `l` shows the raw log.
+5. **Speakers** — diarised speakers ranked by talk time with their
+   longest quote; assign real names, which land in a merged
+   `-transcript.md`.
+6. **Done** — stats (speech time, words, markers, clips), talk-time
+   bars, transcript preview. `p` plays the audio, `t` (re)transcribes,
+   `n` new recording, `o` open folder. A configurable `post_command`
+   runs here with SB_AUDIO / SB_TRANSCRIPT_MD / SB_TRANSCRIPT_DIR /
+   SB_MARKERS in the environment — point it at an LLM summariser, a
+   copy step, whatever.
+7. **Library** — browse past recordings, open, delete, re-transcribe.
 
 ## Architecture
 

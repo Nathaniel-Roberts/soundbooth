@@ -17,6 +17,12 @@ type Config struct {
 	Model      string `json:"model"`
 	Speakers   int    `json:"speakers"` // 0 = auto
 	Language   string `json:"language"`
+
+	Theme       string            `json:"theme"`
+	ThemeColors map[string]string `json:"theme_colors,omitempty"` // per-colour overrides
+	// PostCommand runs via `sh -c` after a successful transcription with
+	// SB_AUDIO, SB_TRANSCRIPT_DIR, SB_TRANSCRIPT_MD, SB_MARKERS in the env.
+	PostCommand string `json:"post_command,omitempty"`
 }
 
 func defaultConfig() Config {
@@ -31,6 +37,7 @@ func defaultConfig() Config {
 		Model:      "large-v3-turbo",
 		Speakers:   0,
 		Language:   "en",
+		Theme:      "mocha",
 	}
 }
 
@@ -70,6 +77,9 @@ func loadConfig() Config {
 	}
 	if cfg.BufferMin < 0 || cfg.BufferMin > 60 {
 		cfg.BufferMin = 10
+	}
+	if cfg.Theme == "" {
+		cfg.Theme = "mocha"
 	}
 	return cfg
 }

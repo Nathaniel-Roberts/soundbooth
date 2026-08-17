@@ -98,6 +98,54 @@ func TestRecorderPauseResumeHardware(t *testing.T) {
 	t.Logf("elapsed=%v size=%d", rec.Elapsed(), info.Size())
 }
 
+func TestCrashRecoveryHardware(t *testing.T) {
+	hwGate(t)
+	file := filepath.Join(t.TempDir(), "crashed.flac")
+	rec, err := NewRecorder(DefaultDevice, file, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rec.Start(); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(2 * time.Second)
+	// Simulate a crash: kill the capture hard, never call Stop.
+	rec.mu.Lock()
+	segDir := rec.segDir
+	cur := rec.cur
+	rec.mu.Unlock()
+	rec.Meter.Stop()
+	_ = cur.Process.Kill()
+	time.Sleep(200 * time.Millisecond)
+
+	orphans := findOrphans()
+	var found *orphan
+	for i := range orphans {
+		if orphans[i].Dir == segDir {
+			found = &orphans[i]
+		}
+	}
+	if found == nil {
+		t.Fatalf("crashed session not found among %d orphan(s)", len(orphans))
+	}
+	if found.Meta.File != file {
+		t.Errorf("meta file = %q, want %q", found.Meta.File, file)
+	}
+	soxPath, _ := findBin("sox")
+	out := filepath.Join(t.TempDir(), "recovered.flac")
+	if err := concatFlac(soxPath, found.Segments, out); err != nil {
+		// A SIGKILLed FLAC may be truncated but should still decode; a
+		// hard failure here means recovery is broken.
+		t.Fatalf("recovery concat failed: %v", err)
+	}
+	info, err := os.Stat(out)
+	if err != nil || info.Size() == 0 {
+		t.Fatalf("recovered file missing or empty")
+	}
+	_ = os.RemoveAll(segDir)
+	t.Logf("recovered %d bytes from crash", info.Size())
+}
+
 func TestSpoolerHardware(t *testing.T) {
 	hwGate(t)
 	spool, err := startSpooler(-1, 1, time.Minute)

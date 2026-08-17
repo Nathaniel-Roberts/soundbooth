@@ -49,17 +49,17 @@ func mixHex(a, b string, t float64) string {
 // to sapphire at the tips.
 func waveRamp(t float64) string {
 	if t < 0.55 {
-		return mixHex("#b4befe", "#89b4fa", t/0.55)
+		return mixHex(th.Lavender, th.Blue, t/0.55)
 	}
-	return mixHex("#89b4fa", "#74c7ec", (t-0.55)/0.45)
+	return mixHex(th.Blue, th.Sapphire, (t-0.55)/0.45)
 }
 
 // vuRamp colours the level bar green -> yellow -> red across its width.
 func vuRamp(t float64) string {
 	if t < 0.76 {
-		return mixHex("#a6e3a1", "#f9e2af", t/0.76)
+		return mixHex(th.Green, th.Yellow, t/0.76)
 	}
-	return mixHex("#f9e2af", "#f38ba8", (t-0.76)/0.24)
+	return mixHex(th.Yellow, th.Red, (t-0.76)/0.24)
 }
 
 // brailleBits is the bit for dot (x 0..1, y 0..3) inside a Braille cell.
@@ -129,8 +129,8 @@ func renderWave(cols []waveCol, wCells, hCells int) string {
 		env[i] = 1
 	}
 
-	clipHex := "#f38ba8"
-	greyHex := "#6c7086"
+	clipHex := th.Red
+	greyHex := th.Overlay0
 
 	var b strings.Builder
 	for row := 0; row < hCells; row++ {
@@ -150,7 +150,7 @@ func renderWave(cols []waveCol, wCells, hCells int) string {
 		}
 		t := float64(outer) / float64(half)
 		envHex := waveRamp(t)
-		coreHex := mixHex(envHex, "#cdd6f4", 0.45)
+		coreHex := mixHex(envHex, th.Text, 0.45)
 
 		var line strings.Builder
 		lastHex := ""
@@ -231,10 +231,22 @@ func renderWave(cols []waveCol, wCells, hCells int) string {
 	return b.String()
 }
 
-// renderRuler draws a DAW-style time ruler under the waveform: marks every
-// 5 s measured back from the right edge (one character cell = 100 ms).
-func renderRuler(wCells int) string {
-	const cellsPer5s = 50
+// renderRuler draws a DAW-style time ruler under the waveform. cellMs is
+// the duration of one character cell; marks land every 5/15/30 s depending
+// on zoom. markerCells are cells-back-from-the-right-edge where the user
+// dropped markers.
+func renderRuler(wCells, cellMs int, markerCells []int) string {
+	if cellMs <= 0 {
+		cellMs = 100
+	}
+	stepSec := 5
+	if cellMs >= 200 {
+		stepSec = 15
+	}
+	stepCells := stepSec * 1000 / cellMs
+	if stepCells < 1 {
+		stepCells = 1
+	}
 	marks := make([]rune, wCells)
 	for i := range marks {
 		marks[i] = '╌'
@@ -259,7 +271,7 @@ func renderRuler(wCells int) string {
 		}
 	}
 	for k := 0; ; k++ {
-		pos := wCells - 1 - k*cellsPer5s
+		pos := wCells - 1 - k*stepCells
 		if pos < 0 {
 			break
 		}
@@ -267,10 +279,72 @@ func renderRuler(wCells int) string {
 		if k == 0 {
 			place(pos, "now")
 		} else {
-			place(pos, fmt.Sprintf("-%ds", k*5))
+			place(pos, fmt.Sprintf("-%ds", k*stepSec))
 		}
 	}
-	return dimStyle.Render(string(marks)) + "\n" + dimStyle.Render(string(labels))
+	line := dimStyle.Render(string(marks))
+	// overlay marker arrows in mauve
+	if len(markerCells) > 0 {
+		markRunes := []rune(string(marks))
+		overlay := make([]bool, wCells)
+		for _, back := range markerCells {
+			pos := wCells - 1 - back
+			if pos >= 0 && pos < wCells {
+				markRunes[pos] = '▼'
+				overlay[pos] = true
+			}
+		}
+		var b strings.Builder
+		for i, r := range markRunes {
+			if overlay[i] {
+				b.WriteString(lipgloss.NewStyle().
+					Foreground(lipgloss.Color(th.Mauve)).Render(string(r)))
+			} else {
+				b.WriteString(dimStyle.Render(string(r)))
+			}
+		}
+		line = b.String()
+	}
+	return line + "\n" + dimStyle.Render(string(labels))
+}
+
+// downsample max-pools groups of z ticks into one sub-column, so zoomed-out
+// views keep peaks visible.
+func downsample(cols []waveCol, z int) []waveCol {
+	if z <= 1 {
+		return cols
+	}
+	out := make([]waveCol, 0, len(cols)/z+1)
+	// group from the tail so the newest tick is always in the last group
+	start := len(cols) % z
+	if start > 0 {
+		out = append(out, poolCols(cols[:start]))
+	}
+	for i := start; i+z <= len(cols); i += z {
+		out = append(out, poolCols(cols[i:i+z]))
+	}
+	return out
+}
+
+func poolCols(group []waveCol) waveCol {
+	var c waveCol
+	for _, g := range group {
+		if g.peak > c.peak {
+			c.peak = g.peak
+		}
+		if g.rms > c.rms {
+			c.rms = g.rms
+		}
+		if g.peakR > c.peakR {
+			c.peakR = g.peakR
+		}
+		if g.rmsR > c.rmsR {
+			c.rmsR = g.rmsR
+		}
+		c.clip = c.clip || g.clip
+		c.paused = c.paused || g.paused
+	}
+	return c
 }
 
 // renderVU draws a gradient level bar with a peak-hold marker.
@@ -290,13 +364,13 @@ func renderVU(width int, level, hold float64) string {
 		switch {
 		case i == holdPos && hold > 0.01:
 			b.WriteString(lipgloss.NewStyle().
-				Foreground(lipgloss.Color("#cdd6f4")).Render("▐"))
+				Foreground(lipgloss.Color(th.Text)).Render("▐"))
 		case i < fill:
 			b.WriteString(lipgloss.NewStyle().
 				Foreground(lipgloss.Color(vuRamp(t))).Render("█"))
 		default:
 			b.WriteString(lipgloss.NewStyle().
-				Foreground(mochaSurface0).Render("░"))
+				Foreground(lipgloss.Color(th.Surface0)).Render("░"))
 		}
 	}
 	db := dbFloor * (1 - hold)
