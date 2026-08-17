@@ -1,0 +1,85 @@
+package main
+
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+)
+
+// Config persists the last-used setup choices.
+type Config struct {
+	Device     string `json:"device"`
+	OutDir     string `json:"out_dir"`
+	Channels   int    `json:"channels"` // 1 = mono, 2 = stereo
+	Transcribe bool   `json:"transcribe"`
+	Model      string `json:"model"`
+	Speakers   int    `json:"speakers"` // 0 = auto
+	Language   string `json:"language"`
+}
+
+func defaultConfig() Config {
+	home, _ := os.UserHomeDir()
+	return Config{
+		Device:     DefaultDevice,
+		OutDir:     filepath.Join(home, "Recordings"),
+		Channels:   1,
+		Transcribe: true,
+		Model:      "large-v3-turbo",
+		Speakers:   0,
+		Language:   "en",
+	}
+}
+
+func configPath() string {
+	home, _ := os.UserHomeDir()
+	base := os.Getenv("XDG_CONFIG_HOME")
+	if base == "" {
+		base = filepath.Join(home, ".config")
+	}
+	return filepath.Join(base, "soundbooth", "config.json")
+}
+
+func loadConfig() Config {
+	cfg := defaultConfig()
+	data, err := os.ReadFile(configPath())
+	if err != nil {
+		return cfg
+	}
+	_ = json.Unmarshal(data, &cfg)
+	if cfg.OutDir == "" {
+		cfg.OutDir = defaultConfig().OutDir
+	}
+	if cfg.Model == "" {
+		cfg.Model = defaultConfig().Model
+	}
+	if cfg.Device == "" {
+		cfg.Device = DefaultDevice
+	}
+	if cfg.Language == "" {
+		cfg.Language = "en"
+	}
+	if cfg.Channels != 1 && cfg.Channels != 2 {
+		cfg.Channels = 1
+	}
+	return cfg
+}
+
+func (c Config) save() error {
+	path := configPath()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(c, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0o644)
+}
+
+// hfTokenPresent reports whether the gated pyannote diarisation model can
+// be used (whispermlx reads the Hugging Face token from this file).
+func hfTokenPresent() bool {
+	home, _ := os.UserHomeDir()
+	info, err := os.Stat(filepath.Join(home, ".cache", "huggingface", "token"))
+	return err == nil && info.Size() > 0
+}
