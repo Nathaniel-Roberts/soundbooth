@@ -43,7 +43,7 @@ const (
 
 var modelChoices = []string{"large-v3-turbo", "large-v3", "medium", "small", "base"}
 var languageChoices = []string{"en", "auto"}
-var bufferChoices = []int{5, 10, 15, 20, 30}
+var bufferChoices = []int{0, 5, 10, 15, 20, 30} // 0 = no buffer, record from trigger
 
 type meterMsg MeterTick
 type meterClosedMsg struct{}
@@ -79,6 +79,8 @@ type model struct {
 	rmaxdb    float64
 	clips     int
 	clipTicks int
+	vuLevel   float64 // fast-attack / slow-release bar level, 0..1
+
 
 	// transcription
 	trans    *Transcriber
@@ -205,6 +207,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.rmaxdb -= 0.5 // decays 10 dB/s at 20 ticks/s
 		if t.DB > m.rmaxdb {
 			m.rmaxdb = t.DB
+		}
+		// VU ballistics: instant attack, exponential release
+		target := t.Peak
+		if t.PeakR > target {
+			target = t.PeakR
+		}
+		if target > m.vuLevel {
+			m.vuLevel = target
+		} else {
+			m.vuLevel *= 0.82
 		}
 		if col.clip {
 			m.clips++
@@ -432,23 +444,26 @@ func (m model) startRecording() (tea.Model, tea.Cmd) {
 }
 
 func (m model) startArmed() (tea.Model, tea.Cmd) {
-	window := time.Duration(m.cfg.BufferMin) * time.Minute
-	spool, err := startSpooler(m.devices[m.devIdx].AVIndex, m.cfg.Channels, window)
+	soxPath, err := findBin("sox")
 	if err != nil {
 		m.setupErr = err.Error()
 		return m, nil
 	}
-	soxPath, err := findBin("sox")
-	if err != nil {
-		spool.Stop()
-		spool.Cleanup()
-		m.setupErr = err.Error()
-		return m, nil
+	var spool *Spooler
+	if m.cfg.BufferMin > 0 {
+		window := time.Duration(m.cfg.BufferMin) * time.Minute
+		spool, err = startSpooler(m.devices[m.devIdx].AVIndex, m.cfg.Channels, window)
+		if err != nil {
+			m.setupErr = err.Error()
+			return m, nil
+		}
 	}
 	meter, err := startMeter(soxPath, m.cfg.Device, m.cfg.Channels)
 	if err != nil {
-		spool.Stop()
-		spool.Cleanup()
+		if spool != nil {
+			spool.Stop()
+			spool.Cleanup()
+		}
 		m.setupErr = err.Error()
 		return m, nil
 	}
@@ -465,6 +480,14 @@ func (m model) startArmed() (tea.Model, tea.Cmd) {
 func (m model) updateArmedKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "enter", "s":
+		if m.spool == nil {
+			// No buffer: standby only — recording starts right now.
+			if m.meter != nil {
+				m.meter.Stop()
+				m.meter = nil
+			}
+			return m.startRecording()
+		}
 		// Save trigger: keep the buffered window, keep capturing forward.
 		m.mark = time.Now()
 		m.spool.Trigger()
@@ -652,7 +675,7 @@ func (m model) viewSetup() string {
 		{"Name", m.nameInput.View()},
 		{"Channels", onOff(m.cfg.Channels == 2, "stereo", "mono")},
 		{"Mode", mode},
-		{"Buffer", fmt.Sprintf("last %d min (armed mode)", m.cfg.BufferMin)},
+		{"Buffer", bufferLabel(m.cfg.BufferMin)},
 		{"Transcribe", onOff(m.cfg.Transcribe, "on", "off")},
 		{"Whisper model", m.cfg.Model},
 		{"Speakers", speakers},
@@ -696,7 +719,7 @@ func (m model) viewLive() string {
 	if wCells < 20 {
 		wCells = 60
 	}
-	hCells := m.height - 10
+	hCells := m.height - 13
 	if hCells > 14 {
 		hCells = 14
 	}
@@ -708,6 +731,12 @@ func (m model) viewLive() string {
 		wave = renderWaveStereo(m.wave, wCells, hCells)
 	} else {
 		wave = renderWave(m.wave, wCells, hCells)
+	}
+	wave += "\n" + renderRuler(wCells)
+
+	panel := panelStyle
+	if m.clipTicks > 0 {
+		panel = panel.BorderForeground(mochaRed)
 	}
 
 	var levelStyle lipgloss.Style
@@ -726,6 +755,10 @@ func (m model) viewLive() string {
 
 	var badge, detail, hints string
 	switch {
+	case m.scr == screenArmed && m.spool == nil:
+		badge = warnStyle.Render("● STANDBY")
+		detail = dimStyle.Render("no buffer — nothing is recorded until you press enter")
+		hints = keyHint("enter", "start recording", "x", "back to setup", "ctrl+c", "quit")
 	case m.scr == screenArmed:
 		buffered := time.Since(m.armStart)
 		window := time.Duration(m.cfg.BufferMin) * time.Minute
@@ -753,8 +786,31 @@ func (m model) viewLive() string {
 		hints = keyHint("p", "pause", "enter", "stop"+transcribeSuffix(m.cfg.Transcribe), "x", "stop, skip transcribe")
 	}
 
+	hold := (m.rmaxdb - dbFloor) / -dbFloor
+	if hold < 0 {
+		hold = 0
+	}
+	if hold > 1 {
+		hold = 1
+	}
+	vuWidth := wCells - 30
+	if vuWidth > 60 {
+		vuWidth = 60
+	}
+	if vuWidth < 16 {
+		vuWidth = 16
+	}
+	vu := renderVU(vuWidth, m.vuLevel, hold)
+
 	status := badge + "  " + level + "  " + detail
-	return lipgloss.JoinVertical(lipgloss.Left, panelStyle.Render(wave), status, "", hints)
+	return lipgloss.JoinVertical(lipgloss.Left, panel.Render(wave), status, vu, "", hints)
+}
+
+func bufferLabel(minutes int) string {
+	if minutes == 0 {
+		return "off — record from trigger (armed mode)"
+	}
+	return fmt.Sprintf("last %d min (armed mode)", minutes)
 }
 
 func fmtDur(d time.Duration) string {

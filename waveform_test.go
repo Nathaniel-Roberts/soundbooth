@@ -44,6 +44,28 @@ func TestRenderWaveStereoLanes(t *testing.T) {
 	}
 }
 
+func TestRulerAndVUBounds(t *testing.T) {
+	for _, w := range []int{1, 2, 5, 40, 200} {
+		_ = renderRuler(w) // must not panic at any width
+	}
+	for _, lvl := range []float64{-0.5, 0, 0.5, 1, 1.5} {
+		_ = renderVU(5, lvl, lvl)
+		_ = renderVU(60, lvl, 1)
+	}
+}
+
+func TestWaveGradientColours(t *testing.T) {
+	if got := mixHex("#000000", "#ffffff", 0.5); got != "#7f7f7f" {
+		t.Errorf("mixHex midpoint = %s", got)
+	}
+	if waveRamp(0) != "#b4befe" {
+		t.Errorf("ramp(0) = %s, want lavender", waveRamp(0))
+	}
+	if waveRamp(1) != "#74c7ec" {
+		t.Errorf("ramp(1) = %s, want sapphire", waveRamp(1))
+	}
+}
+
 func TestLvlMapping(t *testing.T) {
 	if lvl(0) != 0 {
 		t.Errorf("lvl(0) = %v, want 0", lvl(0))

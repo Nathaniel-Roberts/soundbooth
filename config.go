@@ -68,7 +68,7 @@ func loadConfig() Config {
 	if cfg.Mode != "armed" {
 		cfg.Mode = "record"
 	}
-	if cfg.BufferMin < 1 || cfg.BufferMin > 60 {
+	if cfg.BufferMin < 0 || cfg.BufferMin > 60 {
 		cfg.BufferMin = 10
 	}
 	return cfg
