@@ -477,6 +477,9 @@ func (m model) viewDone() string {
 	}
 
 	switch {
+	case m.didTrans && len(m.segs) == 0:
+		// transcription ran but heard nothing — do not pretend there is a
+		// transcript worth opening
 	case m.didTrans && m.txDir != "":
 		lines = append(lines, "")
 		lines = append(lines, okStyle.Render("transcript in    ")+valueStyle.Render(m.txDir))
@@ -512,7 +515,10 @@ func (m model) viewDone() string {
 		playHint = "stop playback"
 	}
 	hintPairs := []string{"p", playHint, "n", "new recording", "o", "open folder"}
-	if !m.didTrans {
+	if m.didTrans && len(m.stats) > 0 {
+		hintPairs = append([]string{"s", "speakers"}, hintPairs...)
+	}
+	if !m.didTrans || len(m.segs) == 0 {
 		hintPairs = append([]string{"t", "transcribe"}, hintPairs...)
 	}
 	if m.fromLib {

@@ -396,6 +396,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.preview = transcriptPreview(m.txDir, m.file, 6)
 		m.segs = loadSegments(m.txDir, m.file)
 		m.stats = speakerStats(m.segs)
+		if len(m.segs) == 0 {
+			m.notice = "transcription found no speech — check mic selection and gain (watch the level meter while talking)"
+			m.scr = screenDone
+			return m, nil
+		}
 		if len(m.stats) > 1 {
 			m.spkCursor = 0
 			m.spkEdit = false
@@ -1051,11 +1056,17 @@ func (m model) updateDoneKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, waitPlay(cmd)
 		}
 	case "t":
-		if !m.didTrans && m.file != "" {
+		if m.file != "" {
 			if _, err := os.Stat(m.file); err == nil {
 				m.transErr = nil
 				return m.beginTranscribe()
 			}
+		}
+	case "s":
+		if m.didTrans && len(m.stats) > 0 {
+			m.spkCursor = 0
+			m.spkEdit = false
+			m.scr = screenSpeakers
 		}
 	case "n":
 		m.stopPlayback()
