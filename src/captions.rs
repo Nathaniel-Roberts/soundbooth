@@ -9,9 +9,62 @@ use std::process::{Child, Command, Stdio};
 const CAPTION_REPO: &str = "mlx-community/whisper-base-mlx";
 const CAPTION_RATE: usize = 16000;
 const CAPTION_SECONDS: usize = 5;
-/// chunks quieter than this peak are skipped: whisper hallucinates
-/// plausible text on silence (~ -42 dBFS)
-const CAPTION_MIN_PEAK: i16 = 260;
+
+/// Speech gate: a chunk is worth captioning only if it has both a real
+/// peak (~-40 dBFS) and sustained energy (>= 3% of samples above ~-48
+/// dBFS). A single desk bump or steady room rumble passes neither, which
+/// is what stops whisper hallucinating on ambient noise.
+pub fn should_caption(chunk: &[i16]) -> bool {
+    const PEAK_MIN: u16 = 330; // ~ -40 dBFS
+    const ACTIVE_MIN: u16 = 130; // ~ -48 dBFS
+    let mut peak: u16 = 0;
+    let mut active = 0usize;
+    for &s in chunk {
+        let a = s.unsigned_abs();
+        if a > peak {
+            peak = a;
+        }
+        if a >= ACTIVE_MIN {
+            active += 1;
+        }
+    }
+    peak >= PEAK_MIN && active * 100 >= chunk.len() * 3
+}
+
+/// Collapse hallucinated repetition ("Captain Captain Captain ...") and
+/// drop captions that are mostly one repeated token.
+pub fn scrub_caption(text: &str) -> String {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    if words.is_empty() {
+        return String::new();
+    }
+    // mostly one token repeated = pure hallucination, drop entirely
+    if words.len() > 6 {
+        let mut counts: std::collections::HashMap<String, usize> = Default::default();
+        for w in &words {
+            *counts.entry(w.to_lowercase()).or_insert(0) += 1;
+        }
+        if let Some(max) = counts.values().max() {
+            if *max * 100 >= words.len() * 60 {
+                return String::new();
+            }
+        }
+    }
+    let mut out: Vec<&str> = Vec::with_capacity(words.len());
+    let mut run = 1usize;
+    for (i, w) in words.iter().enumerate() {
+        if i > 0 && w.eq_ignore_ascii_case(words[i - 1]) {
+            run += 1;
+            if run > 2 {
+                continue; // keep at most two consecutive repeats
+            }
+        } else {
+            run = 1;
+        }
+        out.push(w);
+    }
+    out.join(" ")
+}
 
 fn caption_script() -> String {
     format!(
@@ -24,8 +77,18 @@ for line in sys.stdin:
     if not path:
         continue
     try:
-        r = mlx_whisper.transcribe(path, path_or_hf_repo="{CAPTION_REPO}", language="en")
-        print(json.dumps({{"text": r.get("text", "").strip()}}), flush=True)
+        r = mlx_whisper.transcribe(path, path_or_hf_repo="{CAPTION_REPO}", language="en",
+                                   condition_on_previous_text=False)
+        parts = []
+        for seg in r.get("segments", []):
+            # whisper's own quality signals: high no-speech probability or
+            # high compression ratio (= repetition loop) means hallucination
+            if seg.get("no_speech_prob", 0.0) > 0.6:
+                continue
+            if seg.get("compression_ratio", 0.0) > 2.4:
+                continue
+            parts.append(seg.get("text", "").strip())
+        print(json.dumps({{"text": " ".join(parts).strip()}}), flush=True)
     except Exception as e:
         print(json.dumps({{"err": str(e)}}), flush=True)
 "#
@@ -79,8 +142,7 @@ pub fn start_captioner() -> Result<Captioner, String> {
             acc.extend_from_slice(&pcm);
             while acc.len() >= chunk_samples {
                 let chunk: Vec<i16> = acc.drain(..chunk_samples).collect();
-                let peak = chunk.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
-                if peak >= CAPTION_MIN_PEAK as u16 {
+                if should_caption(&chunk) {
                     let path = dir.join(format!("chunk-{n}.wav"));
                     n += 1;
                     if write_wav(&path, &chunk, CAPTION_RATE as u32).is_ok()
@@ -103,8 +165,9 @@ pub fn start_captioner() -> Result<Captioner, String> {
             let _ = std::fs::remove_file(dir2.join(format!("chunk-{served}.wav")));
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
                 if let Some(text) = v.get("text").and_then(|t| t.as_str()) {
-                    if !text.is_empty() {
-                        let _ = line_tx.try_send(text.to_string());
+                    let clean = scrub_caption(text);
+                    if !clean.is_empty() {
+                        let _ = line_tx.try_send(clean);
                     }
                 }
             }

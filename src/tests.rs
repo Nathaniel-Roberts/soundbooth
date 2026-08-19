@@ -332,3 +332,35 @@ fn doctor_checks_and_simulation() {
     }
     assert_eq!(missing_essential(&reqs), 2);
 }
+
+#[test]
+fn caption_gate_and_scrub() {
+    use crate::captions::{scrub_caption, should_caption};
+    // silence and a single bump both fail the gate
+    let silence = vec![0i16; 80000];
+    assert!(!should_caption(&silence));
+    let mut bump = vec![0i16; 80000];
+    for s in bump.iter_mut().take(200) {
+        *s = 20000; // loud but momentary
+    }
+    assert!(!should_caption(&bump));
+    // sustained speech-like energy passes
+    let mut speech = vec![0i16; 80000];
+    for (i, s) in speech.iter_mut().enumerate() {
+        if i % 3 == 0 {
+            *s = 900;
+        }
+    }
+    assert!(should_caption(&speech));
+
+    // pure repetition loops are dropped
+    assert_eq!(scrub_caption("Captain Captain Captain Captain Captain Captain Captain"), "");
+    // embedded repeats collapse to two
+    assert_eq!(
+        scrub_caption("increase the traffic traffic traffic traffic okay"),
+        "increase the traffic traffic okay"
+    );
+    // normal text is untouched
+    assert_eq!(scrub_caption("Testing one two three"), "Testing one two three");
+    assert_eq!(scrub_caption(""), "");
+}
