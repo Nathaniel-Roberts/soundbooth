@@ -89,6 +89,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
     match app.screen {
         Screen::Setup => draw_setup(f, app, body),
+        Screen::Doctor => draw_doctor(f, app, body),
         Screen::Armed | Screen::Recording => draw_live(f, app, body),
         Screen::Transcribing => draw_transcribing(f, app, body),
         Screen::Speakers => draw_speakers(f, app, body),
@@ -123,6 +124,12 @@ fn setup_rows(app: &App) -> Vec<(String, String)> {
     };
     let speakers = if cfg.speakers == 0 { "auto".into() } else { cfg.speakers.to_string() };
     let start = if cfg.mode == "armed" { "[ Arm replay buffer ]" } else { "[ Start recording ]" };
+    let missing = crate::doctor::missing_essential(&app.reqs);
+    let requirements = if missing == 0 {
+        "all good ✓  (enter to view)".to_string()
+    } else {
+        format!("{missing} missing — enter to set up")
+    };
     vec![
         ("Microphone".into(), app.devices.get(app.dev_idx).cloned().unwrap_or_default()),
         ("Save to".into(), app.out_input.value.clone()),
@@ -138,6 +145,7 @@ fn setup_rows(app: &App) -> Vec<(String, String)> {
         ("Language".into(), cfg.language.clone()),
         ("Theme".into(), cfg.theme.clone()),
         ("Retention".into(), retention),
+        ("Requirements".into(), requirements),
         (String::new(), start.into()),
     ]
 }
@@ -152,6 +160,9 @@ fn draw_setup(f: &mut Frame, app: &mut App, body: Rect) {
         let mut vstyle = if focused { focus(&th) } else { value(&th) };
         if i == F_BUFFER && app.cfg.mode != "armed" && !focused {
             vstyle = dim(&th);
+        }
+        if i == crate::app::F_SETUP && !focused {
+            vstyle = if crate::doctor::missing_essential(&app.reqs) == 0 { ok(&th) } else { warn(&th) };
         }
         let mut val = val.clone();
         if focused && app.editing {
@@ -244,6 +255,74 @@ fn draw_theme_preview(f: &mut Frame, app: &App, area: Rect) {
     sw.push(Span::raw("  "));
     sw.push(Span::styled(format!(" {} ", th.name), Style::default().fg(th.text).bg(th.base)));
     f.render_widget(Paragraph::new(Line::from(sw)), Rect { y: inner.y + 6, height: 1, ..inner });
+}
+
+// ----------------------------------------------------------------------
+// requirements wizard
+
+fn draw_doctor(f: &mut Frame, app: &App, body: Rect) {
+    use crate::doctor::{hf_token_steps, ReqKey, ReqStatus};
+    let th = app.theme;
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled("requirements", value(&th)),
+        Span::styled("  everything soundbooth needs, fixed from here", dim(&th)),
+    ]));
+    lines.push(Line::default());
+
+    for (i, r) in app.reqs.iter().enumerate() {
+        let focused = i == app.req_cursor;
+        let cursor = if focused { Span::styled("> ", focus(&th)) } else { Span::raw("  ") };
+        let installing = app.installer.as_ref().map(|x| x.target == r.key).unwrap_or(false);
+        let icon = if installing || r.status == ReqStatus::Checking {
+            Span::styled(spinner(app), Style::default().fg(th.blue))
+        } else if r.status == ReqStatus::Ok {
+            Span::styled("✓", ok(&th))
+        } else {
+            Span::styled("✗", err(&th))
+        };
+        let lstyle = if focused { focus(&th) } else { value(&th) };
+        let mut spans = vec![cursor, icon, Span::raw(" "), Span::styled(format!("{:<36}", r.key.label()), lstyle)];
+        if installing {
+            spans.push(Span::styled("installing…", warn(&th)));
+        } else if !r.detail.is_empty() {
+            spans.push(Span::styled(r.detail.clone(), dim(&th)));
+        }
+        lines.push(Line::from(spans));
+        if focused && r.status == ReqStatus::Missing && !installing {
+            lines.push(Line::from(Span::styled(format!("      {}", r.key.action_hint()), warn(&th))));
+            if r.key == ReqKey::HfToken {
+                for step in hf_token_steps() {
+                    lines.push(Line::from(Span::styled(format!("      {step}"), dim(&th))));
+                }
+            }
+        }
+    }
+
+    if let Some(e) = &app.install_err {
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(format!("install failed: {e}"), err(&th))));
+    }
+    if app.installer.is_some() && !app.install_log.is_empty() {
+        lines.push(Line::default());
+        let keep = app.install_log.len().saturating_sub(8);
+        for l in &app.install_log[keep..] {
+            let mut l = l.clone();
+            if l.chars().count() > 110 {
+                l = l.chars().take(110).collect::<String>() + "…";
+            }
+            lines.push(Line::from(Span::styled(format!("  {l}"), dim(&th))));
+        }
+    }
+
+    lines.push(Line::default());
+    lines.push(key_hints(&th, &[
+        ("↑↓", "move"),
+        ("enter", "fix selected"),
+        ("r", "re-check all"),
+        ("esc", "back"),
+    ]));
+    f.render_widget(Paragraph::new(lines).block(panel_block(&th)), body);
 }
 
 // ----------------------------------------------------------------------

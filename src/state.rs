@@ -83,6 +83,21 @@ pub fn find_orphans() -> Vec<Orphan> {
             let _ = std::fs::remove_dir_all(&dir);
             continue;
         }
+        // a session whose segments were written in the last two minutes is
+        // almost certainly another live soundbooth instance, not a crash —
+        // offering to "recover" (or delete!) it would corrupt a recording
+        // in progress
+        let newest = o
+            .segments
+            .iter()
+            .filter_map(|p| std::fs::metadata(p).ok())
+            .filter_map(|m| m.modified().ok())
+            .max();
+        if let Some(newest) = newest {
+            if SystemTime::now().duration_since(newest).unwrap_or_default() < Duration::from_secs(120) {
+                continue;
+            }
+        }
         o.segments.sort();
         out.push(o);
     }

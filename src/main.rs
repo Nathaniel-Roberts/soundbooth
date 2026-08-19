@@ -3,6 +3,7 @@ mod audio;
 mod captions;
 mod config;
 mod control;
+mod doctor;
 mod player;
 mod search;
 mod speakers;

@@ -15,6 +15,14 @@ pub fn control_sock_path() -> PathBuf {
 pub fn start_control() -> std::io::Result<Receiver<String>> {
     let path = control_sock_path();
     std::fs::create_dir_all(state_dir())?;
+    // if another instance is alive on the socket, leave it alone — a dev
+    // build must never steal trigger/stop from a recording in progress
+    if UnixStream::connect(&path).is_ok() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AddrInUse,
+            "another soundbooth instance owns the control socket",
+        ));
+    }
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path)?;
     let (tx, rx) = bounded::<String>(16);

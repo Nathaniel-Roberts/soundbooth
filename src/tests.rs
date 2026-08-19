@@ -299,3 +299,36 @@ fn json_nan_and_word_speakers() {
     let stats = crate::speakers::speaker_stats(&segs);
     assert_eq!(stats.len(), 2);
 }
+
+#[test]
+fn doctor_checks_and_simulation() {
+    use crate::doctor::*;
+    // this machine has everything: essentials should be zero
+    let mut reqs = all_reqs();
+    for r in &mut reqs {
+        let (st, d) = check(r.key);
+        r.status = st;
+        r.detail = d;
+    }
+    assert_eq!(missing_essential(&reqs), 0, "dev machine should be fully set up");
+    // uv only counts while whispermlx is absent
+    for r in &mut reqs {
+        if r.key == ReqKey::Uv {
+            r.status = ReqStatus::Missing;
+        }
+    }
+    assert_eq!(missing_essential(&reqs), 0, "uv missing is fine once whispermlx exists");
+    for r in &mut reqs {
+        if r.key == ReqKey::Whispermlx {
+            r.status = ReqStatus::Missing;
+        }
+    }
+    assert_eq!(missing_essential(&reqs), 2, "whispermlx missing drags uv back in");
+    // xcrun is optional
+    for r in &mut reqs {
+        if r.key == ReqKey::Xcrun {
+            r.status = ReqStatus::Missing;
+        }
+    }
+    assert_eq!(missing_essential(&reqs), 2);
+}

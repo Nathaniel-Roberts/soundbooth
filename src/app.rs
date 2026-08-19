@@ -20,6 +20,7 @@ use crate::waveform::WaveCol;
 #[derive(PartialEq, Clone, Copy)]
 pub enum Screen {
     Setup,
+    Doctor,
     Armed,
     Recording,
     Transcribing,
@@ -43,8 +44,9 @@ pub const F_SPEAKERS: usize = 10;
 pub const F_LANGUAGE: usize = 11;
 pub const F_THEME: usize = 12;
 pub const F_RETENTION: usize = 13;
-pub const F_START: usize = 14;
-pub const F_COUNT: usize = 15;
+pub const F_SETUP: usize = 14;
+pub const F_START: usize = 15;
+pub const F_COUNT: usize = 16;
 
 pub const MODEL_CHOICES: [&str; 5] = ["large-v3-turbo", "large-v3", "medium", "small", "base"];
 pub const LANGUAGE_CHOICES: [&str; 2] = ["en", "auto"];
@@ -165,6 +167,14 @@ pub struct App {
     pub hit_cursor: usize,
     pub show_hits: bool,
 
+    // requirements wizard
+    pub reqs: Vec<crate::doctor::Req>,
+    pub req_cursor: usize,
+    pub req_cascade: usize, // next item the staged first check reveals
+    pub installer: Option<crate::doctor::Installer>,
+    pub install_log: Vec<String>,
+    pub install_err: Option<String>,
+
     pub control_rx: Option<Receiver<String>>,
 }
 
@@ -183,6 +193,20 @@ impl App {
         }
         let devices = crate::audio::list_input_devices();
         let dev_idx = devices.iter().position(|d| *d == cfg.device).unwrap_or(0);
+        // initial requirement statuses for the setup-screen row (the mic
+        // check reuses the device scan we just did)
+        let mut reqs = crate::doctor::all_reqs();
+        for r in &mut reqs {
+            if r.key == crate::doctor::ReqKey::Mic {
+                let n = devices.len().saturating_sub(1);
+                r.status = if n > 0 { crate::doctor::ReqStatus::Ok } else { crate::doctor::ReqStatus::Missing };
+                r.detail = format!("{n} device(s)");
+            } else {
+                let (st, detail) = crate::doctor::check(r.key);
+                r.status = st;
+                r.detail = detail;
+            }
+        }
         App {
             out_input: TextInput { value: cfg.out_dir.clone() },
             name_input: TextInput { value: "recording".into() },
@@ -263,6 +287,12 @@ impl App {
             hits: Vec::new(),
             hit_cursor: 0,
             show_hits: false,
+            reqs,
+            req_cursor: 0,
+            req_cascade: usize::MAX, // cascade only animates on wizard entry
+            installer: None,
+            install_log: Vec::new(),
+            install_err: None,
             cfg,
             control_rx: control::start_control().ok(),
         }
@@ -296,6 +326,119 @@ impl App {
             Screen::Recording | Screen::Armed => self.tick_live(),
             Screen::Transcribing => self.tick_transcribing(),
             Screen::Done => self.tick_done(),
+            Screen::Doctor => self.tick_doctor(),
+            _ => {}
+        }
+    }
+
+    fn tick_doctor(&mut self) {
+        use crate::doctor::{check, ReqStatus};
+        // staged first check: reveal one result every ~150 ms so the
+        // spinner-to-tick cascade is visible
+        if self.req_cascade < self.reqs.len() {
+            if self.frame.is_multiple_of(6) {
+                let key = self.reqs[self.req_cascade].key;
+                let (st, detail) = check(key);
+                self.reqs[self.req_cascade].status = st;
+                self.reqs[self.req_cascade].detail = detail;
+                self.req_cascade += 1;
+            }
+            return;
+        }
+        // guided install: stream output, then re-verify the target
+        let mut finished: Option<Result<(), String>> = None;
+        if let Some(inst) = &self.installer {
+            for l in inst.lines.try_iter() {
+                self.install_log.push(l);
+                if self.install_log.len() > 200 {
+                    self.install_log.drain(..100);
+                }
+            }
+            if let Ok(res) = inst.done.try_recv() {
+                finished = Some(res);
+            }
+        }
+        if let Some(res) = finished {
+            let target = self.installer.take().map(|i| i.target);
+            match res {
+                Ok(()) => {
+                    self.install_err = None;
+                    if let Some(t) = target {
+                        crate::doctor::clear_fake(t);
+                    }
+                    for r in &mut self.reqs {
+                        if Some(r.key) == target || r.key == crate::doctor::ReqKey::Uv {
+                            let (st, detail) = check(r.key);
+                            r.status = st;
+                            r.detail = detail;
+                        }
+                    }
+                }
+                Err(e) => self.install_err = Some(e),
+            }
+        }
+        // quiet re-poll every ~2 s so manual fixes (the HF token landing,
+        // an install done in another terminal) flip to green on their own
+        if self.installer.is_none() && self.frame.is_multiple_of(80) {
+            for r in &mut self.reqs {
+                if r.status != ReqStatus::Ok {
+                    let (st, detail) = check(r.key);
+                    r.status = st;
+                    r.detail = detail;
+                }
+            }
+        }
+    }
+
+    fn enter_doctor(&mut self) {
+        self.reqs = crate::doctor::all_reqs();
+        self.req_cascade = 0;
+        self.req_cursor = 0;
+        self.install_log.clear();
+        self.install_err = None;
+        self.screen = Screen::Doctor;
+    }
+
+    fn key_doctor(&mut self, k: KeyEvent) {
+        use crate::doctor::{open_hf_pages, start_install, ReqKey, ReqStatus};
+        match k.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('b') => {
+                // leave any running install going; re-entering shows results
+                self.screen = Screen::Setup;
+            }
+            KeyCode::Up | KeyCode::Char('k') => self.req_cursor = self.req_cursor.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
+                self.req_cursor = (self.req_cursor + 1).min(self.reqs.len().saturating_sub(1))
+            }
+            KeyCode::Char('r') => {
+                if self.installer.is_none() {
+                    self.reqs = crate::doctor::all_reqs();
+                    self.req_cascade = 0;
+                    self.install_err = None;
+                }
+            }
+            KeyCode::Enter => {
+                let Some(req) = self.reqs.get(self.req_cursor) else { return };
+                if req.status != ReqStatus::Missing || self.installer.is_some() {
+                    return;
+                }
+                match req.key {
+                    ReqKey::HfToken => open_hf_pages(),
+                    ReqKey::Mic => {
+                        let _ = std::process::Command::new("open")
+                            .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone")
+                            .spawn();
+                    }
+                    key => match start_install(key) {
+                        Ok(inst) => {
+                            self.install_log.clear();
+                            self.install_err = None;
+                            self.installer = Some(inst);
+                        }
+                        Err(e) => self.install_err = Some(e),
+                    },
+                }
+            }
             _ => {}
         }
     }
@@ -539,6 +682,7 @@ impl App {
         }
         match self.screen {
             Screen::Setup => self.key_setup(k),
+            Screen::Doctor => self.key_doctor(k),
             Screen::Armed => self.key_armed(k),
             Screen::Recording => self.key_recording(k),
             Screen::Transcribing => {
@@ -597,6 +741,7 @@ impl App {
             KeyCode::Enter => match self.cursor {
                 F_OUT_DIR | F_NAME => self.editing = true,
                 F_TRANSCRIBE => self.cfg.transcribe = !self.cfg.transcribe,
+                F_SETUP => self.enter_doctor(),
                 F_START => self.start(),
                 _ => self.adjust_field(1),
             },
