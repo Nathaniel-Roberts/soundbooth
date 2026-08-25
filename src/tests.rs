@@ -303,14 +303,13 @@ fn json_nan_and_word_speakers() {
 #[test]
 fn doctor_checks_and_simulation() {
     use crate::doctor::*;
-    // this machine has everything: essentials should be zero
+    // synthetic all-green baseline: must NOT probe the machine — CI
+    // runners have none of the toolchain installed
     let mut reqs = all_reqs();
     for r in &mut reqs {
-        let (st, d) = check(r.key);
-        r.status = st;
-        r.detail = d;
+        r.status = ReqStatus::Ok;
     }
-    assert_eq!(missing_essential(&reqs), 0, "dev machine should be fully set up");
+    assert_eq!(missing_essential(&reqs), 0);
     // uv only counts while whispermlx is absent
     for r in &mut reqs {
         if r.key == ReqKey::Uv {
