@@ -130,6 +130,19 @@ fn setup_rows(app: &App) -> Vec<(String, String)> {
     } else {
         format!("{missing} missing — enter to set up")
     };
+    let whisper_missing = app.reqs.iter().any(|r| {
+        r.key == crate::doctor::ReqKey::Whispermlx && r.status == crate::doctor::ReqStatus::Missing
+    });
+    let model_value = if whisper_missing {
+        "missing — set up in Requirements below".to_string()
+    } else {
+        cfg.model.clone()
+    };
+    let captions_value = if whisper_missing && cfg.live_captions {
+        "on — but whispermlx is missing (see Requirements)".to_string()
+    } else {
+        on_off(cfg.live_captions, "on — rough captions while recording", "off")
+    };
     vec![
         ("Microphone".into(), app.devices.get(app.dev_idx).cloned().unwrap_or_default()),
         ("Save to".into(), app.out_input.value.clone()),
@@ -139,8 +152,8 @@ fn setup_rows(app: &App) -> Vec<(String, String)> {
         ("Mode".into(), mode.into()),
         ("Buffer".into(), buffer),
         ("Transcribe".into(), on_off(cfg.transcribe, "on", "off")),
-        ("Live captions".into(), on_off(cfg.live_captions, "on — rough captions while recording", "off")),
-        ("Whisper model".into(), cfg.model.clone()),
+        ("Live captions".into(), captions_value),
+        ("Whisper model".into(), model_value),
         ("Speakers".into(), speakers),
         ("Language".into(), cfg.language.clone()),
         ("Theme".into(), cfg.theme.clone()),
@@ -163,6 +176,15 @@ fn draw_setup(f: &mut Frame, app: &mut App, body: Rect) {
         }
         if i == crate::app::F_SETUP && !focused {
             vstyle = if crate::doctor::missing_essential(&app.reqs) == 0 { ok(&th) } else { warn(&th) };
+        }
+        let whisper_gone = app.reqs.iter().any(|r| {
+            r.key == crate::doctor::ReqKey::Whispermlx && r.status == crate::doctor::ReqStatus::Missing
+        });
+        if whisper_gone
+            && !focused
+            && (i == crate::app::F_MODEL || (i == crate::app::F_CAPTIONS && app.cfg.live_captions))
+        {
+            vstyle = warn(&th);
         }
         let mut val = val.clone();
         if focused && app.editing {
