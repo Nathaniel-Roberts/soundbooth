@@ -16,7 +16,7 @@
       packages = forSystems (pkgs: rec {
         soundbooth = pkgs.rustPlatform.buildRustPackage {
           pname = "soundbooth";
-          version = "0.4.0";
+          version = "0.4.1";
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
           nativeBuildInputs = [ pkgs.makeWrapper ];
