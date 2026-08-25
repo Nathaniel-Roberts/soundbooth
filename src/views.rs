@@ -672,6 +672,26 @@ fn draw_library(f: &mut Frame, app: &App, body: Rect) {
         return;
     }
 
+    if app.lib_importing {
+        lines.push(Line::from(vec![
+            Span::styled("import a recording", value(&th)),
+            Span::styled("  m4a, mp3, wav, aiff… converted to FLAC and transcribed", dim(&th)),
+        ]));
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(
+            format!("path: {}▏", app.import_input.value),
+            value(&th),
+        )));
+        lines.push(Line::from(Span::styled(
+            "      tip: drag the file from Finder onto this window to paste its path",
+            dim(&th),
+        )));
+        lines.push(Line::default());
+        lines.push(key_hints(&th, &[("enter", "import"), ("esc", "cancel")]));
+        f.render_widget(Paragraph::new(lines), body);
+        return;
+    }
+
     if app.show_hits {
         lines.push(Line::from(vec![
             Span::styled("library", value(&th)),
@@ -737,8 +757,17 @@ fn draw_library(f: &mut Frame, app: &App, body: Rect) {
             )));
         }
     }
+    if !app.lib_notice.is_empty() {
+        let style = if app.lib_notice.contains("failed") { err(&th) } else { warn(&th) };
+        lines.push(Line::from(Span::styled(app.lib_notice.clone(), style)));
+    } else if app.import_rx.is_some() {
+        lines.push(Line::from(vec![
+            Span::styled(spinner(app), Style::default().fg(th.blue)),
+            Span::styled(" importing…", dim(&th)),
+        ]));
+    }
     lines.push(Line::default());
-    lines.push(key_hints(&th, &[("enter", "open"), ("/", "search"), ("d", "delete"), ("o", "folder"), ("esc", "back")]));
+    lines.push(key_hints(&th, &[("enter", "open"), ("/", "search"), ("i", "import"), ("d", "delete"), ("o", "folder"), ("esc", "back")]));
     f.render_widget(Paragraph::new(lines), body);
 }
 

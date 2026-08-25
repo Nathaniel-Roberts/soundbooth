@@ -43,11 +43,9 @@ fn decode_wave_sync(file: &Path, sub_cols: usize) -> Result<(Vec<WaveCol>, f64),
     if !out.status.success() {
         return Err("decode failed".into());
     }
-    let samples: Vec<i16> = out
-        .stdout
-        .chunks_exact(2)
-        .map(|b| i16::from_le_bytes([b[0], b[1]]))
-        .collect();
+    // note: clippy on CI (newer stable) insists on as_chunks here
+    let (pairs, _) = out.stdout.as_chunks::<2>();
+    let samples: Vec<i16> = pairs.iter().map(|b| i16::from_le_bytes(*b)).collect();
     if samples.is_empty() {
         return Err("empty decode".into());
     }

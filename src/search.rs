@@ -135,3 +135,65 @@ pub fn delete_recording(audio: &Path) {
 pub fn retention_applies(name: &str) -> bool {
     is_own_recording(name)
 }
+
+// ----------------------------------------------------------------------
+// import: bring an existing recording (m4a, mp3, wav, ...) into the
+// library as FLAC so the whole pipeline applies to it
+
+/// Clean a path as pasted or dragged into a terminal: quotes stripped,
+/// backslash-escaped spaces unescaped, ~ expanded.
+pub fn clean_dropped_path(raw: &str) -> String {
+    let s = raw.trim().trim_matches('\'').trim_matches('"').replace("\\ ", " ");
+    crate::app::expand_home(&s)
+}
+
+fn sanitise_stem(stem: &str) -> String {
+    let cleaned: String = stem
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .collect();
+    let trimmed = cleaned.trim_matches('-');
+    if trimmed.is_empty() { "imported".into() } else { trimmed.chars().take(40).collect() }
+}
+
+/// Convert a source recording into the library (async). The destination
+/// gets soundbooth's own naming so retention and search apply to it.
+pub fn import_recording(
+    src: PathBuf,
+    out_dir: PathBuf,
+) -> crossbeam_channel::Receiver<Result<PathBuf, String>> {
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    std::thread::spawn(move || {
+        let _ = tx.send(import_sync(&src, &out_dir));
+    });
+    rx
+}
+
+fn import_sync(src: &Path, out_dir: &Path) -> Result<PathBuf, String> {
+    if !src.is_file() {
+        return Err(format!("no such file: {}", src.display()));
+    }
+    let ffmpeg = crate::state::find_bin("ffmpeg")
+        .ok_or("ffmpeg not found — needed to convert imported audio")?;
+    let stem = sanitise_stem(&crate::transcribe::audio_stem(src));
+    let dest = out_dir.join(format!(
+        "{stem}-{}.flac",
+        chrono::Local::now().format("%Y%m%d-%H%M%S")
+    ));
+    std::fs::create_dir_all(out_dir).map_err(|e| e.to_string())?;
+    let out = std::process::Command::new(ffmpeg)
+        .args(["-hide_banner", "-loglevel", "error", "-i"])
+        .arg(src)
+        .args(["-ar", "48000"])
+        .arg(&dest)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        let _ = std::fs::remove_file(&dest);
+        return Err(format!(
+            "convert failed: {}",
+            String::from_utf8_lossy(&out.stderr).lines().next().unwrap_or("unknown error")
+        ));
+    }
+    Ok(dest)
+}

@@ -364,3 +364,40 @@ fn caption_gate_and_scrub() {
     assert_eq!(scrub_caption("Testing one two three"), "Testing one two three");
     assert_eq!(scrub_caption(""), "");
 }
+
+#[test]
+fn import_conversion() {
+    use crate::search::{clean_dropped_path, import_recording};
+    if crate::state::find_bin("ffmpeg").is_none() || crate::state::find_bin("sox").is_none() {
+        return;
+    }
+    // dragged-path cleanup
+    assert_eq!(clean_dropped_path("'/tmp/My File.m4a'"), "/tmp/My File.m4a");
+    assert_eq!(clean_dropped_path("/tmp/My\\ File.m4a  "), "/tmp/My File.m4a");
+
+    // real conversion: synth flac -> m4a (like a voice memo) -> import
+    let dir = tmp_dir("import");
+    let tone = dir.join("tone.flac");
+    synth(&tone, 2, 440);
+    let m4a = dir.join("Voice Memo 3.m4a");
+    let ffmpeg = crate::state::find_bin("ffmpeg").unwrap();
+    let st = std::process::Command::new(ffmpeg)
+        .args(["-hide_banner", "-loglevel", "error", "-i"])
+        .arg(&tone)
+        .arg(&m4a)
+        .status()
+        .unwrap();
+    assert!(st.success());
+
+    let out_dir = dir.join("library");
+    let rx = import_recording(m4a, out_dir.clone());
+    let dest = rx.recv_timeout(std::time::Duration::from_secs(30)).unwrap().expect("import ok");
+    assert!(dest.exists());
+    assert_eq!(dest.extension().unwrap(), "flac");
+    let name = dest.file_name().unwrap().to_string_lossy().into_owned();
+    assert!(crate::state::is_own_recording(&name), "imported name joins retention/search: {name}");
+    assert!(name.starts_with("Voice-Memo-3-"), "stem sanitised: {name}");
+    // bad path errors cleanly
+    let rx = import_recording(dir.join("nope.mp3"), out_dir);
+    assert!(rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap().is_err());
+}

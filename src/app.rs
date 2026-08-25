@@ -166,6 +166,10 @@ pub struct App {
     pub hits: Vec<SearchHit>,
     pub hit_cursor: usize,
     pub show_hits: bool,
+    pub lib_importing: bool, // typing an import path
+    pub import_input: TextInput,
+    pub import_rx: Option<Receiver<Result<PathBuf, String>>>,
+    pub lib_notice: String,
 
     // requirements wizard
     pub reqs: Vec<crate::doctor::Req>,
@@ -287,6 +291,10 @@ impl App {
             hits: Vec::new(),
             hit_cursor: 0,
             show_hits: false,
+            lib_importing: false,
+            import_input: TextInput::default(),
+            import_rx: None,
+            lib_notice: String::new(),
             reqs,
             req_cursor: 0,
             req_cascade: usize::MAX, // cascade only animates on wizard entry
@@ -327,7 +335,28 @@ impl App {
             Screen::Transcribing => self.tick_transcribing(),
             Screen::Done => self.tick_done(),
             Screen::Doctor => self.tick_doctor(),
+            Screen::Library => self.tick_library(),
             _ => {}
+        }
+    }
+
+    fn tick_library(&mut self) {
+        let Some(rx) = &self.import_rx else { return };
+        let Ok(res) = rx.try_recv() else { return };
+        self.import_rx = None;
+        match res {
+            Err(e) => self.lib_notice = format!("import failed: {e}"),
+            Ok(dest) => {
+                self.lib_notice.clear();
+                self.lib = load_library(&self.cfg.out_dir);
+                if let Some(e) = self.lib.iter().find(|e| e.path == dest).cloned() {
+                    self.open_lib_entry(&e);
+                    if self.cfg.transcribe {
+                        // imported audio joins the normal pipeline
+                        self.begin_transcribe();
+                    }
+                }
+            }
         }
     }
 
@@ -1337,6 +1366,24 @@ impl App {
     }
 
     fn key_library(&mut self, k: KeyEvent) {
+        if self.lib_importing {
+            match k.code {
+                KeyCode::Esc => self.lib_importing = false,
+                KeyCode::Enter => {
+                    self.lib_importing = false;
+                    let path = crate::search::clean_dropped_path(&self.import_input.value);
+                    if !path.is_empty() {
+                        self.lib_notice = format!("importing {path}…");
+                        self.import_rx = Some(crate::search::import_recording(
+                            PathBuf::from(path),
+                            PathBuf::from(&self.cfg.out_dir),
+                        ));
+                    }
+                }
+                _ => self.import_input.key(&k),
+            }
+            return;
+        }
         if self.lib_searching {
             match k.code {
                 KeyCode::Esc => self.lib_searching = false,
@@ -1391,6 +1438,11 @@ impl App {
             KeyCode::Char('/') => {
                 self.lib_searching = true;
                 self.search_input.value.clear();
+            }
+            KeyCode::Char('i') => {
+                self.lib_importing = true;
+                self.import_input.value.clear();
+                self.lib_notice.clear();
             }
             KeyCode::Up | KeyCode::Char('k') => self.lib_cursor = self.lib_cursor.saturating_sub(1),
             KeyCode::Down | KeyCode::Char('j') => {
